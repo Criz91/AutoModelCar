@@ -2,55 +2,29 @@
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 
-// =====================================================
-// CONFIG WIFI
-// =====================================================
-// Puedes usar modo AP o STA.
-// Para pruebas rápidas, AP es más práctico.
-// Tu laptop se conecta directo a la ESP32.
-
 const char* AP_SSID = "ESP32_CAR_CTRL";
 const char* AP_PASS = "12345678";
 
-// =====================================================
-// UART HACIA RASPBERRY PI 5
-// =====================================================
-// Cambia estos pines si ya usas otros
-#define UART_RX_PIN 16   // RX de ESP32 <- TX Raspberry
-#define UART_TX_PIN 17   // TX de ESP32 -> RX Raspberry
-
+#define UART_RX_PIN 16
+#define UART_TX_PIN 17
 HardwareSerial PiSerial(2);
 
-// =====================================================
-// PINES DE MOTORES
-// AJUSTA ESTO SEGÚN TU DRIVER
-// =====================================================
+#define L_IN1 4
+#define L_IN2 5
+#define L_PWM 6
 
-// Motor izquierdo
-#define L_IN1 26
-#define L_IN2 27
-#define L_PWM 25
+#define R_IN1 7
+#define R_IN2 15
+#define R_PWM 38
 
-// Motor derecho
-#define R_IN1 33
-#define R_IN2 32
-#define R_PWM 14
-
-// PWM ESP32
 #define PWM_FREQ 1000
 #define PWM_RES 8
 #define L_PWM_CH 0
 #define R_PWM_CH 1
 
-// =====================================================
-// CONFIG SERVIDOR
-// =====================================================
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
 
-// =====================================================
-// ESTADOS
-// =====================================================
 enum ControlMode {
   MODE_MANUAL = 0,
   MODE_AUTO = 1
@@ -62,11 +36,8 @@ String modeToString(ControlMode m) {
 
 ControlMode currentMode = MODE_MANUAL;
 
-// Valores objetivo
-int targetSpeed = 0;   // -255 a 255
-int targetTurn  = 0;   // -255 a 255
-
-// Valores actuales aplicados (para rampa)
+int targetSpeed = 0;
+int targetTurn  = 0;
 int currentLeft  = 0;
 int currentRight = 0;
 
@@ -76,26 +47,15 @@ unsigned long lastAnyCmdMs    = 0;
 unsigned long lastStatusMs    = 0;
 unsigned long lastRampMs      = 0;
 
-// timeouts
-const unsigned long MANUAL_TIMEOUT_MS = 700;   // si se cae el control manual
-const unsigned long AUTO_TIMEOUT_MS   = 700;   // si se cae la raspberry
-const unsigned long GLOBAL_STOP_MS    = 1000;  // stop total si nadie manda nada
-
-// publicación de estado
+const unsigned long MANUAL_TIMEOUT_MS  = 700;
+const unsigned long AUTO_TIMEOUT_MS    = 700;
+const unsigned long GLOBAL_STOP_MS     = 1000;
 const unsigned long STATUS_INTERVAL_MS = 250;
-
-// rampa
-const unsigned long RAMP_INTERVAL_MS = 20;
+const unsigned long RAMP_INTERVAL_MS   = 20;
 const int RAMP_STEP = 8;
 
-// =====================================================
-// BUFFER UART
-// =====================================================
 String uartBuffer = "";
 
-// =====================================================
-// HTML SIMPLE PARA PRUEBAS
-// =====================================================
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html>
@@ -113,14 +73,12 @@ const char index_html[] PROGMEM = R"rawliteral(
   <button onclick="sendCmd('STOP')">STOP</button>
   <button onclick="sendCmd('MODE,AUTO')">AUTO</button>
   <button onclick="sendCmd('MODE,MANUAL')">MANUAL</button>
-
   <pre id="log"></pre>
-
 <script>
 let ws;
 function log(msg){
   const el = document.getElementById('log');
-  el.textContent += msg + "\\n";
+  el.textContent += msg + "\n";
   el.scrollTop = el.scrollHeight;
 }
 function connect(){
@@ -134,9 +92,7 @@ function connect(){
     log('WebSocket desconectado');
     setTimeout(connect, 1000);
   };
-  ws.onmessage = (event) => {
-    log(event.data);
-  };
+  ws.onmessage = (event) => { log(event.data); };
 }
 function sendCmd(cmd){
   if(ws && ws.readyState === WebSocket.OPEN){
@@ -150,9 +106,6 @@ connect();
 </html>
 )rawliteral";
 
-// =====================================================
-// UTILIDADES
-// =====================================================
 int clamp255(int v) {
   if (v > 255) return 255;
   if (v < -255) return -255;
@@ -175,14 +128,8 @@ String buildStatusMessage() {
 
 void publishStatus() {
   String msg = buildStatusMessage();
-
-  // USB serial
   Serial.println(msg);
-
-  // UART hacia Raspberry
   PiSerial.println(msg);
-
-  // WebSocket hacia PC
   ws.textAll(msg);
 }
 
@@ -192,12 +139,8 @@ void publishInfo(const String& msg) {
   ws.textAll(msg);
 }
 
-// =====================================================
-// CONTROL MOTORES
-// =====================================================
 void setMotorRaw(int in1, int in2, int pwmPin, int channel, int value) {
   value = clamp255(value);
-
   if (value > 0) {
     digitalWrite(in1, HIGH);
     digitalWrite(in2, LOW);
@@ -219,9 +162,9 @@ void applyMotorOutputs(int leftValue, int rightValue) {
 }
 
 void stopMotorsImmediate() {
-  targetSpeed = 0;
-  targetTurn = 0;
-  currentLeft = 0;
+  targetSpeed  = 0;
+  targetTurn   = 0;
+  currentLeft  = 0;
   currentRight = 0;
   applyMotorOutputs(0, 0);
 }
@@ -246,29 +189,13 @@ void updateRamp() {
   unsigned long now = millis();
   if (now - lastRampMs < RAMP_INTERVAL_MS) return;
   lastRampMs = now;
-
   int leftTarget, rightTarget;
   computeTargetsToWheels(targetSpeed, targetTurn, leftTarget, rightTarget);
-
-  currentLeft  = rampTowards(currentLeft, leftTarget, RAMP_STEP);
+  currentLeft  = rampTowards(currentLeft,  leftTarget,  RAMP_STEP);
   currentRight = rampTowards(currentRight, rightTarget, RAMP_STEP);
-
   applyMotorOutputs(currentLeft, currentRight);
 }
 
-// =====================================================
-// PARSER DE COMANDOS
-// FORMATO SOPORTADO:
-//
-// 1) CMD,MANUAL,120,0
-// 2) CMD,AUTO,100,-30
-// 3) MODE,MANUAL
-// 4) MODE,AUTO
-// 5) STOP
-// 6) PING
-//
-// sourceName = "UART" o "WS"
-// =====================================================
 void handleCommand(String cmd, const String& sourceName) {
   cmd.trim();
   if (cmd.length() == 0) return;
@@ -276,11 +203,11 @@ void handleCommand(String cmd, const String& sourceName) {
   publishInfo("RX," + sourceName + "," + cmd);
 
   if (cmd.equalsIgnoreCase("STOP")) {
-    targetSpeed = 0;
-    targetTurn = 0;
+    targetSpeed  = 0;
+    targetTurn   = 0;
     lastAnyCmdMs = millis();
     if (sourceName == "WS") {
-      currentMode = MODE_MANUAL;
+      currentMode     = MODE_MANUAL;
       lastManualCmdMs = millis();
     } else if (sourceName == "UART") {
       lastAutoCmdMs = millis();
@@ -295,19 +222,17 @@ void handleCommand(String cmd, const String& sourceName) {
   }
 
   if (cmd.startsWith("MODE,")) {
-    int comma = cmd.indexOf(',');
-    String modeStr = cmd.substring(comma + 1);
+    String modeStr = cmd.substring(cmd.indexOf(',') + 1);
     modeStr.trim();
-
     if (modeStr.equalsIgnoreCase("MANUAL")) {
-      currentMode = MODE_MANUAL;
+      currentMode     = MODE_MANUAL;
       lastManualCmdMs = millis();
-      lastAnyCmdMs = millis();
+      lastAnyCmdMs    = millis();
       publishInfo("INFO,MODE,MANUAL");
     } else if (modeStr.equalsIgnoreCase("AUTO")) {
-      currentMode = MODE_AUTO;
+      currentMode   = MODE_AUTO;
       lastAutoCmdMs = millis();
-      lastAnyCmdMs = millis();
+      lastAnyCmdMs  = millis();
       publishInfo("INFO,MODE,AUTO");
     } else {
       publishInfo("ERR,UNKNOWN_MODE");
@@ -316,101 +241,73 @@ void handleCommand(String cmd, const String& sourceName) {
   }
 
   if (cmd.startsWith("CMD,")) {
-    // Esperamos: CMD,MANUAL,120,0
     int p1 = cmd.indexOf(',');
     int p2 = cmd.indexOf(',', p1 + 1);
     int p3 = cmd.indexOf(',', p2 + 1);
-
     if (p1 < 0 || p2 < 0 || p3 < 0) {
       publishInfo("ERR,BAD_CMD_FORMAT");
       return;
     }
-
     String modeStr  = cmd.substring(p1 + 1, p2);
     String speedStr = cmd.substring(p2 + 1, p3);
     String turnStr  = cmd.substring(p3 + 1);
-
-    modeStr.trim();
-    speedStr.trim();
-    turnStr.trim();
-
+    modeStr.trim(); speedStr.trim(); turnStr.trim();
     int speedVal = clamp255(speedStr.toInt());
     int turnVal  = clamp255(turnStr.toInt());
 
     if (modeStr.equalsIgnoreCase("MANUAL")) {
-      currentMode = MODE_MANUAL;
-      targetSpeed = speedVal;
-      targetTurn  = turnVal;
+      currentMode     = MODE_MANUAL;
+      targetSpeed     = speedVal;
+      targetTurn      = turnVal;
       lastManualCmdMs = millis();
-      lastAnyCmdMs = millis();
+      lastAnyCmdMs    = millis();
       publishInfo("INFO,APPLIED,MANUAL," + String(speedVal) + "," + String(turnVal));
       return;
     }
 
     if (modeStr.equalsIgnoreCase("AUTO")) {
-      // Solo aplicar AUTO si no está secuestrado por manual vigente
       unsigned long now = millis();
       bool manualStillActive = (now - lastManualCmdMs) < MANUAL_TIMEOUT_MS;
-
       if (currentMode == MODE_MANUAL && manualStillActive && sourceName == "UART") {
         publishInfo("INFO,AUTO_IGNORED_MANUAL_ACTIVE");
-        lastAutoCmdMs = now;   // sí vimos a la Raspberry viva
-        lastAnyCmdMs = now;
+        lastAutoCmdMs = now;
+        lastAnyCmdMs  = now;
         return;
       }
-
-      currentMode = MODE_AUTO;
-      targetSpeed = speedVal;
-      targetTurn  = turnVal;
+      currentMode   = MODE_AUTO;
+      targetSpeed   = speedVal;
+      targetTurn    = turnVal;
       lastAutoCmdMs = millis();
-      lastAnyCmdMs = millis();
+      lastAnyCmdMs  = millis();
       publishInfo("INFO,APPLIED,AUTO," + String(speedVal) + "," + String(turnVal));
       return;
     }
-
     publishInfo("ERR,UNKNOWN_CMD_MODE");
     return;
   }
-
   publishInfo("ERR,UNKNOWN_COMMAND");
 }
 
-// =====================================================
-// WEBSOCKET
-// =====================================================
-void onWsEvent(AsyncWebSocket *server,
-               AsyncWebSocketClient *client,
-               AwsEventType type,
-               void *arg,
-               uint8_t *data,
-               size_t len) {
+void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
+               AwsEventType type, void *arg, uint8_t *data, size_t len) {
   if (type == WS_EVT_CONNECT) {
-    String msg = "INFO,WS_CLIENT_CONNECTED," + String(client->id());
-    publishInfo(msg);
+    publishInfo("INFO,WS_CLIENT_CONNECTED," + String(client->id()));
     client->text(buildStatusMessage());
-  }
-  else if (type == WS_EVT_DISCONNECT) {
+  } else if (type == WS_EVT_DISCONNECT) {
     publishInfo("INFO,WS_CLIENT_DISCONNECTED," + String(client->id()));
-  }
-  else if (type == WS_EVT_DATA) {
+  } else if (type == WS_EVT_DATA) {
     AwsFrameInfo *info = (AwsFrameInfo*)arg;
     if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT) {
       String cmd = "";
-      for (size_t i = 0; i < len; i++) {
-        cmd += (char)data[i];
-      }
+      for (size_t i = 0; i < len; i++) cmd += (char)data[i];
       handleCommand(cmd, "WS");
     }
   }
 }
 
-// =====================================================
-// UART
-// =====================================================
 void readUARTCommands() {
   while (PiSerial.available()) {
     char c = (char)PiSerial.read();
-
     if (c == '\n') {
       handleCommand(uartBuffer, "UART");
       uartBuffer = "";
@@ -424,51 +321,37 @@ void readUARTCommands() {
   }
 }
 
-// =====================================================
-// TIMEOUTS Y LÓGICA DE SEGURIDAD
-// =====================================================
 void handleTimeouts() {
   unsigned long now = millis();
-
   bool manualExpired = (now - lastManualCmdMs) > MANUAL_TIMEOUT_MS;
   bool autoExpired   = (now - lastAutoCmdMs)   > AUTO_TIMEOUT_MS;
   bool globalExpired = (now - lastAnyCmdMs)    > GLOBAL_STOP_MS;
 
-  // si manual expiró y estábamos en manual, podemos caer a auto
   if (currentMode == MODE_MANUAL && manualExpired) {
-    // si hay auto reciente, regresamos a auto
     if (!autoExpired) {
       currentMode = MODE_AUTO;
       publishInfo("INFO,MODE_FALLBACK_TO_AUTO");
     } else {
       targetSpeed = 0;
-      targetTurn = 0;
+      targetTurn  = 0;
     }
   }
-
-  // si auto expiró y estamos en auto, stop
   if (currentMode == MODE_AUTO && autoExpired) {
     targetSpeed = 0;
-    targetTurn = 0;
+    targetTurn  = 0;
   }
-
-  // si nadie manda nada, stop total
   if (globalExpired) {
     targetSpeed = 0;
-    targetTurn = 0;
+    targetTurn  = 0;
   }
 }
 
-// =====================================================
-// SETUP
-// =====================================================
 void setup() {
   Serial.begin(115200);
   delay(300);
 
   PiSerial.begin(115200, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
 
-  // pines motores
   pinMode(L_IN1, OUTPUT);
   pinMode(L_IN2, OUTPUT);
   pinMode(R_IN1, OUTPUT);
@@ -476,25 +359,20 @@ void setup() {
 
   ledcSetup(L_PWM_CH, PWM_FREQ, PWM_RES);
   ledcSetup(R_PWM_CH, PWM_FREQ, PWM_RES);
-
   ledcAttachPin(L_PWM, L_PWM_CH);
   ledcAttachPin(R_PWM, R_PWM_CH);
 
   stopMotorsImmediate();
 
-  // WiFi AP
   WiFi.mode(WIFI_AP);
   bool apOk = WiFi.softAP(AP_SSID, AP_PASS);
-
   if (apOk) {
-    IPAddress ip = WiFi.softAPIP();
     Serial.print("AP IP: ");
-    Serial.println(ip);
+    Serial.println(WiFi.softAPIP());
   } else {
-    Serial.println("ERROR: no se pudo levantar AP");
+    Serial.println("ERROR: fallo al crear AP");
   }
 
-  // web
   ws.onEvent(onWsEvent);
   server.addHandler(&ws);
 
@@ -519,16 +397,12 @@ void setup() {
   publishInfo("INFO,DEFAULT_MODE,MANUAL");
 }
 
-// =====================================================
-// LOOP
-// =====================================================
 void loop() {
   readUARTCommands();
   handleTimeouts();
   updateRamp();
 
   unsigned long now = millis();
-
   if (now - lastStatusMs >= STATUS_INTERVAL_MS) {
     lastStatusMs = now;
     publishStatus();
