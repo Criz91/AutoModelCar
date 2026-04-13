@@ -95,6 +95,8 @@ class CarControllerGUI:
 
         ttk.Button(auto_frame, text="Toggle Sensor Test (T)",
                    command=lambda: self.send("T")).pack(fill="x", pady=(2, 0))
+        ttk.Button(auto_frame, text="Toggle Intermitentes (H)",
+                   command=lambda: self.send("H")).pack(fill="x", pady=(2, 0))
 
         info = ttk.Label(frm, text="Tip: WASD con esta ventana enfocada. Esc o cualquier tecla = cancelar AUTO.")
         info.pack(anchor="w", pady=(8, 0))

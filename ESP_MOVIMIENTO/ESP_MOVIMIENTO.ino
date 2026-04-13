@@ -243,6 +243,7 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
       if      (cmd == "PR") { if (mode == MANUAL) startParking(+1); }
       else if (cmd == "PL") { if (mode == MANUAL) startParking(-1); }
       else if (cmd == "T")  { mode = (mode == SENSOR_TEST) ? MANUAL : SENSOR_TEST; }
+      else if (cmd == "H")  { hazardOn = !hazardOn; Serial.print("Hazards: "); Serial.println(hazardOn ? "ON" : "OFF"); }
       else if (cmd == "W")  driveForward();
       else if (cmd == "S")  driveReverse();
       else if (cmd == "X")  driveStop();
