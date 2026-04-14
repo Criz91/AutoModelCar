@@ -10,21 +10,35 @@ ESP32_IP = "192.168.4.1"
 WS_URL = f"ws://{ESP32_IP}/ws"
 
 
-# ---------- Sliders de calibracion ----------
-# (key, label, min, max, default)
+# Lista de sliders de calibracion que aparecen en el panel derecho.
+# Cada entrada es (clave, etiqueta visible, minimo, maximo, valor inicial).
+# La clave es la misma que entiende el firmware en applyParam(),
+# asi al mover el slider se manda "SET:clave=valor" por WebSocket
+# y el ESP32 ajusta el parametro en vivo sin reflashear.
 SLIDERS = [
     ("driveSpeed",       "Velocidad manual (PWM)",        0,    255,  180),
-    ("parkDriveSpeed",   "Velocidad estacionar (PWM)",    0,    255,  130),
+    ("parkDriveSpeed",   "Velocidad estacionar (PWM)",    0,    255,  200),
     ("steerSpeed",       "Velocidad direccion (PWM)",     0,    255,  170),
     ("tSteerFullMs",     "Tiempo direccion tope-tope ms", 100,  1500, 400),
     ("steerTrimMs",      "Trim centro direccion ms",     -150,  150,  0),
-    ("tAvanceInicialMs", "Avance inicial recto (ms)",     0,    10000, 2500),
-    ("distCarroCm",      "Dist. ve carro (<) cm",         5,    100,  35),
+    ("tAvanceInicialMs", "Override avance inicial (ms)",  0,    10000, 0),
+    ("distCarroCm",      "Dist. ve carro (<) cm",         5,    100,  25),
     ("distHuecoCm",      "Dist. ve hueco (>) cm",         10,   200,  45),
     ("distFrenaSuaveCm", "Dist. frena suave (banqueta)",  3,    50,   15),
     ("distParaYaCm",     "Dist. para ya (banqueta)",      2,    30,   8),
-    ("tAvanzarHuecoMs",  "Avance tras hueco (ms)",        0,    5000, 700),
+    ("tAvanzarHuecoMs",  "Override avance tras hueco ms", 0,    5000, 0),
     ("minHuecoStableMs", "Hueco estable min (ms)",        0,    2000, 250),
+    # Geometria fisica del carro y parametros de la maniobra automatica.
+    ("carLargoCm",       "Largo del carro (cm)",          5,    100,  29),
+    ("carAnchoCm",       "Ancho del carro (cm)",          5,    50,   14),
+    ("carAltoCm",        "Alto del carro (cm)",           5,    50,   25),
+    ("margenHuecoCm",    "Margen lateral hueco (cm)",     0,    30,   6),
+    ("margenBanquetaCm", "Margen banqueta (cm)",          0,    20,   4),
+    ("cmPorSegPark",     "Velocidad parking (cm/s)",      5,    200,  30),
+    ("distInicialCm",    "Avance inicial (cm)",           20,   300,  100),
+    ("kickStartPWM",     "Kick-start PWM",                100,  255,  240),
+    ("kickStartMs",      "Kick-start duracion (ms)",      0,    500,  150),
+    ("tReversaGiroMs",   "Tiempo reversa con giro (ms)",  200,  5000, 1600),
 ]
 
 STATE_COLORS = {
@@ -79,9 +93,8 @@ class CarControllerGUI:
         self.root.bind("<KeyRelease>", self.on_key_release)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
-    # =========================================================
-    #  UI
-    # =========================================================
+    # Construye toda la interfaz: tres columnas (estado, controles,
+    # calibracion). Se llama una sola vez desde __init__.
     def _build_ui(self):
         outer = ttk.Frame(self.root, padding=10)
         outer.pack(fill="both", expand=True)
@@ -255,9 +268,9 @@ class CarControllerGUI:
                        variable=var, command=on_change)
         sc.pack(fill="x")
 
-    # =========================================================
-    #  Asyncio
-    # =========================================================
+    # Loop de asyncio que vive en su propio thread. Toda la
+    # comunicacion WebSocket se programa con run_coroutine_threadsafe
+    # para no bloquear el thread principal de Tkinter.
     def _run_loop(self):
         asyncio.set_event_loop(self.loop)
         self.loop.run_forever()
@@ -315,9 +328,9 @@ class CarControllerGUI:
             self.connected = False
             self._set_status(False)
 
-    # =========================================================
-    #  UI helpers
-    # =========================================================
+    # Helpers de UI: actualizan widgets desde callbacks de Tkinter.
+    # Todo lo que toca widgets se enrutea por root.after para que
+    # corra en el thread principal aunque venga del listener async.
     def _set_status(self, ok: bool):
         def _do():
             if ok:
@@ -359,7 +372,9 @@ class CarControllerGUI:
     def estop(self):
         self.send("ESTOP")
 
-    # ---- teclas ----
+    # Manejo de teclado. WASD se mandan como comandos individuales
+    # al firmware (igual que los botones), y al soltar la tecla se
+    # envia "X" (parar tracion) o "C" (centrar direccion) segun el caso.
     def on_key_press(self, event):
         k = event.keysym.lower()
         if k in self.pressed:
