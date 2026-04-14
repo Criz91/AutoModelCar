@@ -1,112 +1,267 @@
 import asyncio
+import json
 import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
+
 import websockets
 
 ESP32_IP = "192.168.4.1"
 WS_URL = f"ws://{ESP32_IP}/ws"
 
 
+# ---------- Sliders de calibracion ----------
+# (key, label, min, max, default)
+SLIDERS = [
+    ("driveSpeed",       "Velocidad manual (PWM)",        0,    255,  180),
+    ("parkDriveSpeed",   "Velocidad estacionar (PWM)",    0,    255,  130),
+    ("steerSpeed",       "Velocidad direccion (PWM)",     0,    255,  170),
+    ("tSteerFullMs",     "Tiempo direccion tope-tope ms", 100,  1500, 400),
+    ("steerTrimMs",      "Trim centro direccion ms",     -150,  150,  0),
+    ("tAvanceInicialMs", "Avance inicial recto (ms)",     0,    10000, 2500),
+    ("distCarroCm",      "Dist. ve carro (<) cm",         5,    100,  35),
+    ("distHuecoCm",      "Dist. ve hueco (>) cm",         10,   200,  45),
+    ("distFrenaSuaveCm", "Dist. frena suave (banqueta)",  3,    50,   15),
+    ("distParaYaCm",     "Dist. para ya (banqueta)",      2,    30,   8),
+    ("tAvanzarHuecoMs",  "Avance tras hueco (ms)",        0,    5000, 700),
+    ("minHuecoStableMs", "Hueco estable min (ms)",        0,    2000, 250),
+]
+
+STATE_COLORS = {
+    "MANUAL":  "#9e9e9e",
+    "TEST":    "#42a5f5",
+    "AUTO":    "#ffb300",
+    "DONE":    "#43a047",
+    "ABORT":   "#e53935",
+    "?":       "#9e9e9e",
+}
+
+
 class CarControllerGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("ESP32 Car Controller (WebSocket)")
-        self.root.geometry("560x520")
+        self.root.title("AutoModelCar - Panel de Control")
+        self.root.geometry("1180x720")
+        self.root.configure(bg="#1e1e1e")
 
-        # Variables de estado y conexion
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure(".",
+                        background="#1e1e1e", foreground="#e0e0e0",
+                        fieldbackground="#2a2a2a")
+        style.configure("TLabel", background="#1e1e1e", foreground="#e0e0e0")
+        style.configure("TLabelframe", background="#1e1e1e", foreground="#e0e0e0")
+        style.configure("TLabelframe.Label", background="#1e1e1e",
+                        foreground="#90caf9", font=("Segoe UI", 10, "bold"))
+        style.configure("TFrame", background="#1e1e1e")
+        style.configure("TButton", padding=6, font=("Segoe UI", 9))
+        style.configure("Big.TButton", padding=10, font=("Segoe UI", 11, "bold"))
+        style.configure("Estop.TButton", padding=14,
+                        font=("Segoe UI", 13, "bold"),
+                        background="#e53935", foreground="white")
+        style.map("Estop.TButton", background=[("active", "#ff5252")])
+
         self.ws = None
         self.connected = False
+        self.pressed = set()
 
-        # Almacena los ultimos comandos enviados
-        self.last_drive = "X"  # W/S/X
-        self.last_steer = "C"  # A/D/C
-
-        # Variables para las velocidades visuales en la interfaz
-        self.drive_speed = tk.IntVar(value=180)
-        self.steer_speed = tk.IntVar(value=160)
+        self.slider_vars = {}
+        for k, _, _, _, default in SLIDERS:
+            self.slider_vars[k] = tk.IntVar(value=default)
 
         self._build_ui()
 
-        # Configura y arranca el loop de asyncio en un hilo separado
         self.loop = asyncio.new_event_loop()
         self.thread = threading.Thread(target=self._run_loop, daemon=True)
         self.thread.start()
 
-        # Vinculacion de eventos de teclado
         self.root.bind("<KeyPress>", self.on_key_press)
         self.root.bind("<KeyRelease>", self.on_key_release)
-        self.pressed = set()
-
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
+    # =========================================================
+    #  UI
+    # =========================================================
     def _build_ui(self):
-        frm = ttk.Frame(self.root, padding=12)
-        frm.pack(fill="both", expand=True)
+        outer = ttk.Frame(self.root, padding=10)
+        outer.pack(fill="both", expand=True)
 
-        # Seccion de conexion
-        conn_frame = ttk.LabelFrame(frm, text="Conexion", padding=10)
-        conn_frame.pack(fill="x")
+        outer.columnconfigure(0, weight=1, uniform="col")
+        outer.columnconfigure(1, weight=1, uniform="col")
+        outer.columnconfigure(2, weight=1, uniform="col")
+        outer.rowconfigure(0, weight=1)
 
-        self.lbl_status = ttk.Label(conn_frame, text="Desconectado")
+        col_left  = ttk.Frame(outer); col_left.grid (row=0, column=0, sticky="nsew", padx=4)
+        col_mid   = ttk.Frame(outer); col_mid.grid  (row=0, column=1, sticky="nsew", padx=4)
+        col_right = ttk.Frame(outer); col_right.grid(row=0, column=2, sticky="nsew", padx=4)
+
+        self._build_left  (col_left)
+        self._build_mid   (col_mid)
+        self._build_right (col_right)
+
+    def _build_left(self, parent):
+        conn = ttk.LabelFrame(parent, text="Conexion", padding=10)
+        conn.pack(fill="x", pady=(0, 8))
+
+        self.lbl_status = ttk.Label(conn, text="Desconectado",
+                                    font=("Segoe UI", 10, "bold"),
+                                    foreground="#e57373")
         self.lbl_status.pack(side="left")
 
-        ttk.Button(conn_frame, text="Conectar", command=self.connect).pack(side="right", padx=6)
-        ttk.Button(conn_frame, text="Desconectar", command=self.disconnect).pack(side="right", padx=6)
+        ttk.Button(conn, text="Conectar",    command=self.connect   ).pack(side="right", padx=3)
+        ttk.Button(conn, text="Desconectar", command=self.disconnect).pack(side="right", padx=3)
 
-        # Seccion de estado actual
-        state_frame = ttk.LabelFrame(frm, text="Estado (lo que se manda al ESP32)", padding=10)
-        state_frame.pack(fill="x", pady=10)
+        st = ttk.LabelFrame(parent, text="Estado", padding=10)
+        st.pack(fill="x", pady=(0, 8))
 
-        self.lbl_drive = ttk.Label(state_frame, text="Traccion: X (STOP)")
-        self.lbl_drive.pack(anchor="w")
+        self.state_canvas = tk.Canvas(st, height=70, bg="#9e9e9e",
+                                      highlightthickness=0)
+        self.state_canvas.pack(fill="x")
+        self.state_text = self.state_canvas.create_text(
+            10, 35, anchor="w", text="MANUAL",
+            font=("Segoe UI", 18, "bold"), fill="white")
+        self.substate_text = self.state_canvas.create_text(
+            10, 58, anchor="w", text="-",
+            font=("Segoe UI", 9), fill="white")
 
-        self.lbl_steer = ttk.Label(state_frame, text="Direccion: C (CENTER)")
-        self.lbl_steer.pack(anchor="w")
+        sens = ttk.LabelFrame(parent, text="Sensores (cm)", padding=10)
+        sens.pack(fill="x", pady=(0, 8))
 
-        # Seccion de controles manuales
-        ctrl_frame = ttk.LabelFrame(frm, text="Controles manuales (WASD)", padding=10)
-        ctrl_frame.pack(fill="x")
+        self.lbl_R = self._mk_big_label(sens, "Derecho",   "999")
+        self.lbl_L = self._mk_big_label(sens, "Izquierdo", "999")
+        self.lbl_B = self._mk_big_label(sens, "Trasero",   "999")
 
-        row1 = ttk.Frame(ctrl_frame)
-        row1.pack(fill="x", pady=3)
-        ttk.Button(row1, text="W (Forward)", command=lambda: self.set_drive("W")).pack(side="left", expand=True, fill="x", padx=3)
-        ttk.Button(row1, text="X (Stop)",      command=lambda: self.set_drive("X")).pack(side="left", expand=True, fill="x", padx=3)
-        ttk.Button(row1, text="S (Reverse)", command=lambda: self.set_drive("S")).pack(side="left", expand=True, fill="x", padx=3)
+        dr = ttk.LabelFrame(parent, text="Direccion (estimada)", padding=10)
+        dr.pack(fill="x", pady=(0, 8))
 
-        row2 = ttk.Frame(ctrl_frame)
-        row2.pack(fill="x", pady=3)
-        ttk.Button(row2, text="A (Left)",   command=lambda: self.set_steer("A")).pack(side="left", expand=True, fill="x", padx=3)
-        ttk.Button(row2, text="C (Center)",   command=lambda: self.set_steer("C")).pack(side="left", expand=True, fill="x", padx=3)
-        ttk.Button(row2, text="D (Right)",  command=lambda: self.set_steer("D")).pack(side="left", expand=True, fill="x", padx=3)
+        self.lbl_steer_pos = ttk.Label(dr, text="200 ms",
+                                       font=("Segoe UI", 12, "bold"))
+        self.lbl_steer_pos.pack(anchor="w")
 
-        ttk.Button(ctrl_frame, text="FULL STOP (X + C)", command=self.full_stop).pack(fill="x", pady=6)
+        self.steer_bar = tk.Canvas(dr, height=20, bg="#2a2a2a",
+                                   highlightthickness=0)
+        self.steer_bar.pack(fill="x", pady=(4, 0))
+        self.steer_bar_rect = self.steer_bar.create_rectangle(
+            0, 0, 0, 20, fill="#42a5f5", width=0)
 
-        # Seccion de modo autonomo
-        auto_frame = ttk.LabelFrame(frm, text="Modo autonomo", padding=10)
-        auto_frame.pack(fill="x", pady=10)
+    def _mk_big_label(self, parent, name, initial):
+        row = ttk.Frame(parent)
+        row.pack(fill="x", pady=2)
+        ttk.Label(row, text=name + ":", width=10).pack(side="left")
+        lbl = ttk.Label(row, text=initial, font=("Consolas", 16, "bold"),
+                        foreground="#90caf9")
+        lbl.pack(side="left")
+        return lbl
 
-        park_row = ttk.Frame(auto_frame)
-        park_row.pack(fill="x", pady=3)
-        ttk.Button(park_row, text="Estacionar IZQUIERDA",
-                   command=lambda: self.start_park("PL")).pack(side="left", expand=True, fill="x", padx=3)
-        ttk.Button(park_row, text="Estacionar DERECHA",
-                   command=lambda: self.start_park("PR")).pack(side="left", expand=True, fill="x", padx=3)
+    def _build_mid(self, parent):
+        ctrl = ttk.LabelFrame(parent, text="Control manual (WASD)", padding=10)
+        ctrl.pack(fill="x", pady=(0, 8))
 
-        ttk.Button(auto_frame, text="Toggle Sensor Test (T)",
-                   command=lambda: self.send("T")).pack(fill="x", pady=(2, 0))
-        ttk.Button(auto_frame, text="Toggle Intermitentes (H)",
-                   command=lambda: self.send("H")).pack(fill="x", pady=(2, 0))
+        row1 = ttk.Frame(ctrl); row1.pack(fill="x", pady=3)
+        ttk.Button(row1, text="W\nForward", style="Big.TButton",
+                   command=lambda: self.send("W")
+                   ).pack(side="left", expand=True, fill="both", padx=2)
+        ttk.Button(row1, text="X\nStop", style="Big.TButton",
+                   command=lambda: self.send("X")
+                   ).pack(side="left", expand=True, fill="both", padx=2)
+        ttk.Button(row1, text="S\nReverse", style="Big.TButton",
+                   command=lambda: self.send("S")
+                   ).pack(side="left", expand=True, fill="both", padx=2)
 
-        info = ttk.Label(frm, text="Tip: WASD con esta ventana enfocada. Esc o cualquier tecla = cancelar AUTO.")
+        row2 = ttk.Frame(ctrl); row2.pack(fill="x", pady=3)
+        ttk.Button(row2, text="A\nLeft", style="Big.TButton",
+                   command=lambda: self.send("A")
+                   ).pack(side="left", expand=True, fill="both", padx=2)
+        ttk.Button(row2, text="C\nCenter", style="Big.TButton",
+                   command=lambda: self.send("C")
+                   ).pack(side="left", expand=True, fill="both", padx=2)
+        ttk.Button(row2, text="D\nRight", style="Big.TButton",
+                   command=lambda: self.send("D")
+                   ).pack(side="left", expand=True, fill="both", padx=2)
+
+        auto = ttk.LabelFrame(parent, text="Modo autonomo", padding=10)
+        auto.pack(fill="x", pady=(0, 8))
+
+        prow = ttk.Frame(auto); prow.pack(fill="x", pady=3)
+        ttk.Button(prow, text="Estacionar IZQUIERDA", style="Big.TButton",
+                   command=lambda: self.send("PL")
+                   ).pack(side="left", expand=True, fill="x", padx=2)
+        ttk.Button(prow, text="Estacionar DERECHA", style="Big.TButton",
+                   command=lambda: self.send("PR")
+                   ).pack(side="left", expand=True, fill="x", padx=2)
+
+        urow = ttk.Frame(auto); urow.pack(fill="x", pady=3)
+        ttk.Button(urow, text="Sensor Test (T)",
+                   command=lambda: self.send("T")
+                   ).pack(side="left", expand=True, fill="x", padx=2)
+        ttk.Button(urow, text="Hazards (H)",
+                   command=lambda: self.send("H")
+                   ).pack(side="left", expand=True, fill="x", padx=2)
+        ttk.Button(urow, text="Recalibrar (CAL)",
+                   command=lambda: self.send("CAL")
+                   ).pack(side="left", expand=True, fill="x", padx=2)
+
+        estop = ttk.Frame(parent)
+        estop.pack(fill="x", pady=(8, 0))
+        ttk.Button(estop, text="PARO DE EMERGENCIA",
+                   style="Estop.TButton",
+                   command=self.estop).pack(fill="x", ipady=6)
+
+        info = ttk.Label(parent,
+                         text="Tip: WASD con la ventana enfocada.\n"
+                              "Cualquier tecla durante AUTO cancela.\n"
+                              "Esc = paro de emergencia.",
+                         justify="left", foreground="#9e9e9e")
         info.pack(anchor="w", pady=(8, 0))
 
+    def _build_right(self, parent):
+        cal = ttk.LabelFrame(parent, text="Calibracion en vivo", padding=10)
+        cal.pack(fill="both", expand=True)
+
+        canvas = tk.Canvas(cal, bg="#1e1e1e", highlightthickness=0)
+        sb = ttk.Scrollbar(cal, orient="vertical", command=canvas.yview)
+        inner = ttk.Frame(canvas)
+
+        inner.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=sb.set)
+
+        canvas.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+
+        for key, label, mn, mx, default in SLIDERS:
+            self._mk_slider(inner, key, label, mn, mx, default)
+
+    def _mk_slider(self, parent, key, label, mn, mx, default):
+        frm = ttk.Frame(parent)
+        frm.pack(fill="x", pady=4)
+
+        head = ttk.Frame(frm); head.pack(fill="x")
+        ttk.Label(head, text=label, font=("Segoe UI", 9)).pack(side="left")
+        val_lbl = ttk.Label(head, text=str(default),
+                            font=("Consolas", 10, "bold"),
+                            foreground="#90caf9", width=6, anchor="e")
+        val_lbl.pack(side="right")
+
+        var = self.slider_vars[key]
+
+        def on_change(_e=None):
+            v = int(float(var.get()))
+            val_lbl.config(text=str(v))
+            self.send(f"SET:{key}={v}")
+
+        sc = ttk.Scale(frm, from_=mn, to=mx, orient="horizontal",
+                       variable=var, command=on_change)
+        sc.pack(fill="x")
+
+    # =========================================================
+    #  Asyncio
+    # =========================================================
     def _run_loop(self):
-        # Establece y corre el ciclo de eventos en este hilo
         asyncio.set_event_loop(self.loop)
         self.loop.run_forever()
 
-    # Metodos de conexion WebSocket
     def connect(self):
         asyncio.run_coroutine_threadsafe(self._connect_ws(), self.loop)
 
@@ -116,12 +271,24 @@ class CarControllerGUI:
                 await self.ws.close()
             self.ws = await websockets.connect(WS_URL)
             self.connected = True
-            self._ui_status(True)
+            self._set_status(True)
+            asyncio.ensure_future(self._listen_loop())
         except Exception as e:
             self.connected = False
             self.ws = None
-            self._ui_status(False)
-            self.root.after(0, lambda: messagebox.showerror("Error", f"No se pudo conectar:\n{e}"))
+            self._set_status(False)
+            self.root.after(0, lambda: messagebox.showerror(
+                "Error", f"No se pudo conectar:\n{e}"))
+
+    async def _listen_loop(self):
+        try:
+            while self.ws:
+                msg = await self.ws.recv()
+                self._handle_telemetry(msg)
+        except Exception:
+            self.ws = None
+            self.connected = False
+            self._set_status(False)
 
     def disconnect(self):
         asyncio.run_coroutine_threadsafe(self._disconnect_ws(), self.loop)
@@ -133,15 +300,8 @@ class CarControllerGUI:
         finally:
             self.ws = None
             self.connected = False
-            self._ui_status(False)
+            self._set_status(False)
 
-    def _ui_status(self, ok: bool):
-        # Actualiza el texto de estado en el hilo de la interfaz
-        def _do():
-            self.lbl_status.config(text="Conectado" if ok else "Desconectado")
-        self.root.after(0, _do)
-
-    # Metodos para enviar datos
     def send(self, msg: str):
         asyncio.run_coroutine_threadsafe(self._send(msg), self.loop)
 
@@ -151,72 +311,79 @@ class CarControllerGUI:
         try:
             await self.ws.send(msg)
         except Exception:
-            # En caso de error, resetea la conexion
             self.ws = None
             self.connected = False
-            self._ui_status(False)
+            self._set_status(False)
 
-    # Logica de actualizacion de comandos
-    def set_drive(self, cmd):
-        self.last_drive = cmd
-        if cmd == "W":
-            self.lbl_drive.config(text="Traccion: W (FORWARD)")
-        elif cmd == "S":
-            self.lbl_drive.config(text="Traccion: S (REVERSE)")
-        else:
-            self.lbl_drive.config(text="Traccion: X (STOP)")
-        self.send(cmd)
+    # =========================================================
+    #  UI helpers
+    # =========================================================
+    def _set_status(self, ok: bool):
+        def _do():
+            if ok:
+                self.lbl_status.config(text="Conectado", foreground="#81c784")
+            else:
+                self.lbl_status.config(text="Desconectado", foreground="#e57373")
+        self.root.after(0, _do)
 
-    def set_steer(self, cmd):
-        self.last_steer = cmd
-        if cmd == "A":
-            self.lbl_steer.config(text="Direccion: A (LEFT)")
-        elif cmd == "D":
-            self.lbl_steer.config(text="Direccion: D (RIGHT)")
-        else:
-            self.lbl_steer.config(text="Direccion: C (CENTER)")
-        self.send(cmd)
+    def _handle_telemetry(self, msg):
+        try:
+            j = json.loads(msg)
+        except Exception:
+            return
+        if j.get("t") != "tel":
+            return
 
-    def full_stop(self):
-        self.set_drive("X")
-        self.set_steer("C")
+        def _do():
+            self.lbl_R.config(text=str(j.get("R", "?")))
+            self.lbl_L.config(text=str(j.get("L", "?")))
+            self.lbl_B.config(text=str(j.get("B", "?")))
 
-    def start_park(self, cmd):
-        side = "DERECHA" if cmd == "PR" else "IZQUIERDA"
-        self.lbl_drive.config(text=f"Traccion: AUTO PARK {side}")
-        self.lbl_steer.config(text=f"Direccion: AUTO PARK {side}")
-        self.send(cmd)
+            sp = int(j.get("sp", 0))
+            self.lbl_steer_pos.config(text=f"{sp} ms")
 
-    # Manejo de eventos de teclado
+            tmax = self.slider_vars["tSteerFullMs"].get() or 400
+            ratio = max(0.0, min(1.0, sp / float(tmax)))
+            w = self.steer_bar.winfo_width()
+            self.steer_bar.coords(self.steer_bar_rect, 0, 0, w * ratio, 20)
+
+            mode = j.get("mode", "?")
+            sub  = j.get("st", "-")
+            color = STATE_COLORS.get(mode, "#9e9e9e")
+            self.state_canvas.config(bg=color)
+            self.state_canvas.itemconfig(self.state_text, text=mode)
+            self.state_canvas.itemconfig(self.substate_text, text=sub)
+
+        self.root.after(0, _do)
+
+    def estop(self):
+        self.send("ESTOP")
+
+    # ---- teclas ----
     def on_key_press(self, event):
         k = event.keysym.lower()
+        if k in self.pressed:
+            return
         self.pressed.add(k)
 
-        if k == "w":
-            self.set_drive("W")
-        elif k == "s":
-            self.set_drive("S")
-        elif k == "a":
-            self.set_steer("A")
-        elif k == "d":
-            self.set_steer("D")
-        elif k == "escape":
-            self.full_stop()
+        if k == "w":      self.send("W")
+        elif k == "s":    self.send("S")
+        elif k == "a":    self.send("A")
+        elif k == "d":    self.send("D")
+        elif k == "escape": self.estop()
 
     def on_key_release(self, event):
         k = event.keysym.lower()
-        if k in self.pressed:
-            self.pressed.remove(k)
+        self.pressed.discard(k)
 
         if k in ("w", "s"):
-            self.set_drive("X")
+            self.send("X")
         if k in ("a", "d"):
-            self.set_steer("C")
+            self.send("C")
 
     def on_close(self):
-        # Detiene el vehiculo y cierra la conexion antes de salir
         try:
-            self.full_stop()
+            self.estop()
         except Exception:
             pass
         self.disconnect()

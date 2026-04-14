@@ -3,105 +3,100 @@
 #include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
 
-// ESP32_CAR - AutoModelCar TMR 2026
-// Estacionamiento autonomo en bateria (izquierda o derecha)
+// =========================================================
+//  ESP32_CAR - AutoModelCar TMR 2026
+//  Estacionamiento autonomo en bateria (izquierda o derecha)
+// =========================================================
 
-// Configuracion de red WiFi (Punto de Acceso)
+// ====== WiFi AP ======
 const char* ap_ssid = "ESP32_PRUEBA";
 const char* ap_pass = "123456785";
 
-// Asignacion de pines del ESP32
-const int IN1 = 12, IN2 = 13, ENA = 18;   // Control de direccion (Motor A)
-const int IN3 = 14, IN4 = 11, ENB = 8;    // Control de traccion (Motor B)
+// ====== Pines ======
+const int IN1 = 12, IN2 = 13, ENA = 18;   // Direccion
+const int IN3 = 14, IN4 = 11, ENB = 8;    // Traccion
 
-const int TRIG_R = 4,  ECHO_R = 5;        // Sensor ultrasonico derecho
-const int TRIG_L = 6,  ECHO_L = 7;        // Sensor ultrasonico izquierdo
-const int TRIG_B = 15, ECHO_B = 9;        // Sensor ultrasonico trasero
+const int TRIG_R = 4,  ECHO_R = 5;
+const int TRIG_L = 6,  ECHO_L = 7;
+const int TRIG_B = 15, ECHO_B = 9;
 
-const int LED_L = 10, LED_R = 21;         // Leds indicadores (direccionales/intermitentes)
+const int LED_L = 10, LED_R = 21;
 
-// Configuracion de la senal PWM para el control de velocidad
-const int PWM_FREQ = 20000;               // Frecuencia de 20kHz
-const int PWM_RES = 8;                    // Resolucion de 8 bits (0-255)
-const int CH_STEER = 0;                   // Canal PWM para direccion
-const int CH_DRIVE = 1;                   // Canal PWM para traccion
+// ====== PWM ======
+const int PWM_FREQ = 20000, PWM_RES = 8;
+const int CH_STEER = 0, CH_DRIVE = 1;
 
-// Estructura de parametros que pueden ser modificados en tiempo real via web
+// =========================================================
+//  PARAMETROS AJUSTABLES EN VIVO (desde GUI)
+// =========================================================
 struct Params {
-  int driveSpeed         = 180;   // Velocidad PWM para traccion manual
-  int parkDriveSpeed     = 130;   // Velocidad PWM para traccion automatica (mas lento)
-  int steerSpeed         = 230;   // Velocidad PWM para el motor de direccion
-  int tSteerFullMs       = 400;   // Tiempo en milisegundos para girar de tope a tope
-  int steerTrimMs        = 0;     // Ajuste fino del centro de la direccion (-100 a +100)
-  int distCarroCm        = 35;    // Distancia maxima para considerar que hay un carro estacionado
-  int distHuecoCm        = 45;    // Distancia minima para considerar que hay un espacio vacio
-  int distFrenaSuaveCm   = 15;    // Distancia trasera para comenzar a frenar suavemente
-  int distParaYaCm       = 8;     // Distancia trasera critica para detencion total
-  int tAvanzarHuecoMs    = 700;   // Tiempo de avance extra tras detectar el hueco antes de girar
-  int minHuecoStableMs   = 250;   // Tiempo que el hueco debe mantenerse estable para validarlo
-  int maxAutoMs          = 60000; // Tiempo maximo de seguridad para la maniobra completa (watchdog)
+  int driveSpeed         = 180;   // PWM traccion manual
+  int parkDriveSpeed     = 130;   // PWM traccion auto (mas lento)
+  int steerSpeed         = 170;   // PWM direccion (mas suave)
+  int tSteerFullMs       = 400;   // tope a tope de la direccion
+  int steerTrimMs        = 0;     // sesgo de centro (-150..+150)
+  int distCarroCm        = 35;    // ve carro si 
+  int distHuecoCm        = 45;    // ve hueco si >
+  int distFrenaSuaveCm   = 15;    // frenar suave atras
+  int distParaYaCm       = 8;     // parar definitivamente atras
+  int tAvanceInicialMs   = 2500;  // avance recto inicial (~1 m)
+  int tAvanzarHuecoMs    = 700;   // ms tras detectar hueco antes de girar
+  int minHuecoStableMs   = 250;   // hueco debe sostenerse este tiempo
+  int maxAutoMs          = 60000; // watchdog del modo auto
 };
 Params P;
 
-// Definicion de los modos de operacion del vehiculo
+// =========================================================
+//  ESTADO GLOBAL
+// =========================================================
 enum Mode { MANUAL, AUTO_PARK, SENSOR_TEST };
 volatile Mode mode = MANUAL;
 
-// Definicion de los estados de la maquina de estados de estacionamiento
 enum ParkState {
-  IDLE, BUSCAR_CARRO, BUSCAR_HUECO, AVANZAR_AL_CENTRO,
+  IDLE, AVANCE_INICIAL, BUSCAR_CARRO, BUSCAR_HUECO, AVANZAR_AL_CENTRO,
   GIRAR_RUEDAS, REVERSA, FRENA_SUAVE, CENTRAR_FINAL, ESTACIONADO, ABORTADO
 };
 ParkState parkState = IDLE;
-unsigned long stateStart = 0; // Tiempo de inicio del estado actual
-unsigned long autoStart  = 0; // Tiempo de inicio de la maniobra automatica
+unsigned long stateStart = 0;
+unsigned long autoStart  = 0;
 
-int parkSide = +1;  // Indica de que lado estacionar: +1=derecha, -1=izquierda
+int parkSide = +1;  // +1=derecha, -1=izquierda
 
-// Variables para estimar la posicion de la direccion basada en el tiempo (lazo abierto)
+// Posicion estimada de la direccion (open-loop)
 int steerPosMs   = 200;
 int steerMoveDir = 0;
 int steerMoveDur = 0;
 unsigned long steerMoveStart = 0;
 
-// Estado de las luces intermitentes: 0=apagado, 1=lento, 2=rapido, 3=fijo, 4=doble parpadeo
-volatile int hazardMode = 0;
+// Hazards / LED de estado
+volatile int hazardMode = 0;  // 0=off, 1=lento, 2=rapido, 3=fijo, 4=doble flash
 
-// Estructura para filtrar lecturas falsas de los sensores usando la mediana de 5 valores
+// Filtros de mediana por sensor (5 muestras)
 struct MedianFilter {
   long buf[5] = {999,999,999,999,999};
   int idx = 0;
-  
-  // Agrega un nuevo valor al buffer circular
   void push(long v) { buf[idx] = v; idx = (idx + 1) % 5; }
-  
-  // Calcula y retorna la mediana de los valores almacenados
   long get() {
-    long s[5]; 
-    for (int i=0;i<5;i++) s[i]=buf[i];
-    for (int i=0;i<4;i++) {
-      for (int j=i+1;j<5;j++) {
-        if (s[i]>s[j]) { long t=s[i]; s[i]=s[j]; s[j]=t; }
-      }
-    }
+    long s[5]; for (int i=0;i<5;i++) s[i]=buf[i];
+    for (int i=0;i<4;i++) for (int j=i+1;j<5;j++)
+      if (s[i]>s[j]) { long t=s[i]; s[i]=s[j]; s[j]=t; }
     return s[2];
   }
 };
 MedianFilter filtR, filtL, filtB;
 
-// Variables para almacenar las ultimas distancias procesadas
 volatile long lastR = 999, lastL = 999, lastB = 999;
 
-// Contadores para asegurar lecturas estables en los sensores
 int countCarro = 0;
 int countHueco = 0;
 unsigned long huecoOpenStart = 0;
 
-// Objetos del servidor web y WebSocket
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
 
-// Control basico de los motores (sentido y velocidad)
+// =========================================================
+//  MOTORES
+// =========================================================
 void setMotor(int in1, int in2, int ch, int speed) {
   int s = constrain(abs(speed), 0, 255);
   if (speed > 0)      { digitalWrite(in1, HIGH); digitalWrite(in2, LOW); }
@@ -110,17 +105,14 @@ void setMotor(int in1, int in2, int ch, int speed) {
   ledcWrite(ch, s);
 }
 
-// Funciones para movimiento de traccion
 void driveForward(int s = -1) { setMotor(IN3, IN4, CH_DRIVE, +(s<0?P.driveSpeed:s)); }
 void driveReverse(int s = -1) { setMotor(IN3, IN4, CH_DRIVE, -(s<0?P.driveSpeed:s)); }
 void driveStop()              { setMotor(IN3, IN4, CH_DRIVE, 0); }
 
-// Funciones para movimiento de direccion manual
 void steerRawLeft()  { setMotor(IN1, IN2, CH_STEER, -P.steerSpeed); steerMoveDir = 0; }
 void steerRawRight() { setMotor(IN1, IN2, CH_STEER, +P.steerSpeed); steerMoveDir = 0; }
 void steerRawStop()  { setMotor(IN1, IN2, CH_STEER, 0);             steerMoveDir = 0; }
 
-// Inicia un movimiento de direccion temporizado para modo automatico
 void steerTimed(int dir, int durMs) {
   steerMoveDir = dir;
   steerMoveDur = durMs;
@@ -128,11 +120,8 @@ void steerTimed(int dir, int durMs) {
   if (dir > 0)      setMotor(IN1, IN2, CH_STEER, +P.steerSpeed);
   else if (dir < 0) setMotor(IN1, IN2, CH_STEER, -P.steerSpeed);
 }
-
-// Verifica si la direccion se esta moviendo actualmente
 bool steerBusy() { return steerMoveDir != 0; }
 
-// Actualiza el estado del motor de direccion, deteniendolo si ya cumplio su tiempo
 void steerUpdate() {
   if (steerMoveDir == 0) return;
   unsigned long el = millis() - steerMoveStart;
@@ -143,20 +132,16 @@ void steerUpdate() {
   }
 }
 
-// Mueve la direccion a una posicion objetivo estimada en milisegundos
 void steerGoTo(int targetMs) {
   targetMs = constrain(targetMs, 0, P.tSteerFullMs);
   int d = targetMs - steerPosMs;
   if (d == 0) return;
   steerTimed(d > 0 ? +1 : -1, abs(d));
 }
-
-// Funciones para posiciones predefinidas de direccion
 void steerCenter()    { steerGoTo(P.tSteerFullMs / 2 + P.steerTrimMs); }
 void steerFullLeft()  { steerGoTo(0); }
 void steerFullRight() { steerGoTo(P.tSteerFullMs); }
 
-// Rutina de calibracion de direccion: topa a la izquierda para definir el punto cero
 void steerCalibrateHome() {
   setMotor(IN1, IN2, CH_STEER, -P.steerSpeed);
   delay(P.tSteerFullMs + 250);
@@ -165,20 +150,20 @@ void steerCalibrateHome() {
   steerMoveDir = 0;
 }
 
-// Frena todo movimiento
 void fullStop() { driveStop(); steerRawStop(); }
 
-// Funcion para medir distancia con sensor ultrasonico
+// =========================================================
+//  HC-SR04
+// =========================================================
 long medirCm(int trig, int echo) {
   digitalWrite(trig, LOW); delayMicroseconds(2);
   digitalWrite(trig, HIGH); delayMicroseconds(10);
   digitalWrite(trig, LOW);
-  long dur = pulseIn(echo, HIGH, 25000); // Timeout de 25ms para no bloquear demasiado
+  long dur = pulseIn(echo, HIGH, 25000);
   if (dur == 0) return 999;
   return dur * 0.0343 / 2;
 }
 
-// Actualiza las lecturas de los tres sensores y aplica el filtro
 void leerSensores() {
   filtR.push(medirCm(TRIG_R, ECHO_R));
   filtL.push(medirCm(TRIG_L, ECHO_L));
@@ -188,35 +173,35 @@ void leerSensores() {
   lastB = filtB.get();
 }
 
-// Tarea ejecutada en paralelo (FreeRTOS) para controlar las luces indicadoras
+// =========================================================
+//  HAZARDS / LED de estado
+// =========================================================
 void hazardTask(void *p) {
-  pinMode(LED_L, OUTPUT); 
-  pinMode(LED_R, OUTPUT);
+  pinMode(LED_L, OUTPUT); pinMode(LED_R, OUTPUT);
   bool on = false;
   int subStep = 0;
-  
   while (true) {
     int delayMs = 300;
     switch (hazardMode) {
-      case 0: // Apagado
+      case 0:
         digitalWrite(LED_L, LOW); digitalWrite(LED_R, LOW);
         delayMs = 100;
         break;
-      case 1: // Parpadeo lento
+      case 1:
         on = !on;
         digitalWrite(LED_L, on); digitalWrite(LED_R, on);
         delayMs = 350;
         break;
-      case 2: // Parpadeo rapido
+      case 2:
         on = !on;
         digitalWrite(LED_L, on); digitalWrite(LED_R, on);
         delayMs = 120;
         break;
-      case 3: // Fijo (encendido)
+      case 3:
         digitalWrite(LED_L, HIGH); digitalWrite(LED_R, HIGH);
         delayMs = 200;
         break;
-      case 4: // Doble parpadeo (advertencia de error)
+      case 4:
         subStep = (subStep + 1) % 6;
         if (subStep == 0 || subStep == 2) {
           digitalWrite(LED_L, HIGH); digitalWrite(LED_R, HIGH);
@@ -230,14 +215,32 @@ void hazardTask(void *p) {
   }
 }
 
-// Inicia la secuencia automatica de estacionamiento
+// 5 parpadeos rapidos bloqueantes antes de arrancar
+void preflashLeds() {
+  for (int i = 0; i < 5; i++) {
+    digitalWrite(LED_L, HIGH); digitalWrite(LED_R, HIGH);
+    delay(150);
+    digitalWrite(LED_L, LOW); digitalWrite(LED_R, LOW);
+    delay(150);
+  }
+}
+
+// =========================================================
+//  ESTACIONAMIENTO
+// =========================================================
 void startParking(int side) {
   parkSide = side;
   Serial.print(">>> AUTO PARK START side=");
   Serial.println(side > 0 ? "DERECHA" : "IZQUIERDA");
+
+  // Pausa hazards y hace preflash
+  hazardMode = 0;
+  delay(50);
+  preflashLeds();
+
   mode = AUTO_PARK;
-  hazardMode = 1;
-  parkState = BUSCAR_CARRO;
+  hazardMode = 0;  // apagados durante avance inicial
+  parkState = AVANCE_INICIAL;
   stateStart = millis();
   autoStart  = millis();
   countCarro = 0;
@@ -246,7 +249,6 @@ void startParking(int side) {
   steerCenter();
 }
 
-// Cancela la secuencia automatica por seguridad o intervencion manual
 void abortParking(const char* m) {
   Serial.print("ABORT: "); Serial.println(m);
   fullStop();
@@ -255,7 +257,6 @@ void abortParking(const char* m) {
   parkState = ABORTADO;
 }
 
-// Finaliza exitosamente la secuencia de estacionamiento
 void finishParking() {
   Serial.println(">>> ESTACIONADO");
   fullStop();
@@ -264,13 +265,12 @@ void finishParking() {
   parkState = ESTACIONADO;
 }
 
-// Maquina de estados principal que controla el proceso de estacionamiento
 void parkingLoop() {
   if (mode != AUTO_PARK) return;
 
-  // Verificacion de tiempo maximo de seguridad (Watchdog)
+  // Watchdog global
   if (millis() - autoStart > (unsigned long)P.maxAutoMs) {
-    abortParking("watchdog 60s");
+    abortParking("watchdog");
     return;
   }
 
@@ -279,12 +279,21 @@ void parkingLoop() {
 
   switch (parkState) {
 
-    case BUSCAR_CARRO:
-      // Espera a que la direccion se centre antes de avanzar
+    case AVANCE_INICIAL:
+      // Avanza recto sin buscar nada (el "1 metro inicial")
       if (steerBusy()) { driveStop(); break; }
       driveForward(P.parkDriveSpeed);
-      
-      // Valida si esta pasando junto a un carro estacionado
+      if (millis() - stateStart > (unsigned long)P.tAvanceInicialMs) {
+        Serial.println("Fin avance inicial -> buscar carro");
+        parkState = BUSCAR_CARRO;
+        stateStart = millis();
+        countCarro = 0;
+      }
+      break;
+
+    case BUSCAR_CARRO:
+      if (steerBusy()) { driveStop(); break; }
+      driveForward(P.parkDriveSpeed);
       if (dLat < P.distCarroCm && dLat > 3) countCarro++; else countCarro = 0;
       if (countCarro >= 3) {
         Serial.println("Carro 1 OK");
@@ -297,8 +306,6 @@ void parkingLoop() {
 
     case BUSCAR_HUECO:
       driveForward(P.parkDriveSpeed);
-      
-      // Valida si encontro un hueco lo suficientemente grande
       if (dLat > P.distHuecoCm) {
         countHueco++;
         if (countHueco == 1) huecoOpenStart = millis();
@@ -306,10 +313,9 @@ void parkingLoop() {
         countHueco = 0;
         huecoOpenStart = 0;
       }
-      
       if (countHueco >= 5 && (millis() - huecoOpenStart) >= (unsigned long)P.minHuecoStableMs) {
         Serial.println("Hueco OK");
-        hazardMode = 2;
+        hazardMode = 1;  // intermitentes ON al confirmar hueco
         parkState = AVANZAR_AL_CENTRO;
         stateStart = millis();
       }
@@ -318,8 +324,6 @@ void parkingLoop() {
 
     case AVANZAR_AL_CENTRO:
       driveForward(P.parkDriveSpeed);
-      
-      // Avanza un poco mas para alinear la parte trasera del carro con el hueco
       if (millis() - stateStart > (unsigned long)P.tAvanzarHuecoMs) {
         driveStop();
         if (parkSide > 0) steerFullRight(); else steerFullLeft();
@@ -330,7 +334,6 @@ void parkingLoop() {
 
     case GIRAR_RUEDAS:
       driveStop();
-      // Espera a que las ruedas terminen de girar hacia el hueco
       if (!steerBusy()) {
         driveReverse(P.parkDriveSpeed);
         parkState = REVERSA;
@@ -339,17 +342,12 @@ void parkingLoop() {
       break;
 
     case REVERSA:
-      // Si se acerca demasiado lateralmente a un objeto, aborta para evitar colision
       if (dLat < 4) { abortParking("lateral muy cerca"); break; }
-      
-      // Si el muro trasero esta cerca, disminuye la velocidad
       if (dBack < P.distFrenaSuaveCm && dBack > 1) {
         driveReverse(P.parkDriveSpeed * 0.6);
         parkState = FRENA_SUAVE;
         stateStart = millis();
       }
-      
-      // Paro por seguridad si pasa mucho tiempo en reversa
       if (millis() - stateStart > 4500) {
         driveStop();
         steerCenter();
@@ -359,15 +357,12 @@ void parkingLoop() {
       break;
 
     case FRENA_SUAVE:
-      // Se detiene completamente si esta a la distancia limite del muro trasero
       if (dBack < P.distParaYaCm && dBack > 1) {
         driveStop();
         steerCenter();
         parkState = CENTRAR_FINAL;
         stateStart = millis();
       }
-      
-      // Respaldo por tiempo por si el sensor trasero falla
       if (millis() - stateStart > 1500) {
         driveStop();
         steerCenter();
@@ -378,7 +373,6 @@ void parkingLoop() {
 
     case CENTRAR_FINAL:
       driveStop();
-      // Termina cuando las ruedas regresan a su posicion central
       if (!steerBusy()) finishParking();
       break;
 
@@ -386,7 +380,9 @@ void parkingLoop() {
   }
 }
 
-// Retorna el nombre del modo actual en texto
+// =========================================================
+//  TELEMETRIA
+// =========================================================
 const char* modeName() {
   switch (mode) {
     case MANUAL:      return parkState == ESTACIONADO ? "DONE" :
@@ -397,10 +393,10 @@ const char* modeName() {
   return "?";
 }
 
-// Retorna el nombre de la etapa actual de estacionamiento en texto
 const char* parkStateName() {
   switch (parkState) {
     case IDLE: return "IDLE";
+    case AVANCE_INICIAL: return "AVANCE_INI";
     case BUSCAR_CARRO: return "BUSCAR_CARRO";
     case BUSCAR_HUECO: return "BUSCAR_HUECO";
     case AVANZAR_AL_CENTRO: return "AVANZAR";
@@ -414,7 +410,6 @@ const char* parkStateName() {
   return "?";
 }
 
-// Envia informacion del sistema a los clientes conectados via WebSocket
 void sendTelemetry() {
   if (ws.count() == 0) return;
   StaticJsonDocument<256> j;
@@ -431,7 +426,9 @@ void sendTelemetry() {
   ws.textAll(buf, n);
 }
 
-// Aplica los cambios de configuracion recibidos por red asegurando que esten en rango
+// =========================================================
+//  WEBSOCKET
+// =========================================================
 void applyParam(const String& k, int v) {
   if      (k=="driveSpeed")       P.driveSpeed       = constrain(v,0,255);
   else if (k=="parkDriveSpeed")   P.parkDriveSpeed   = constrain(v,0,255);
@@ -442,12 +439,12 @@ void applyParam(const String& k, int v) {
   else if (k=="distHuecoCm")      P.distHuecoCm      = constrain(v,10,200);
   else if (k=="distFrenaSuaveCm") P.distFrenaSuaveCm = constrain(v,3,50);
   else if (k=="distParaYaCm")     P.distParaYaCm     = constrain(v,2,30);
+  else if (k=="tAvanceInicialMs") P.tAvanceInicialMs = constrain(v,0,10000);
   else if (k=="tAvanzarHuecoMs")  P.tAvanzarHuecoMs  = constrain(v,0,5000);
   else if (k=="minHuecoStableMs") P.minHuecoStableMs = constrain(v,0,2000);
   else if (k=="maxAutoMs")        P.maxAutoMs        = constrain(v,5000,300000);
 }
 
-// Procesa los mensajes entrantes del WebSocket
 void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
                AwsEventType type, void *arg, uint8_t *data, size_t len) {
   if (type == WS_EVT_DATA) {
@@ -458,7 +455,6 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
     for (size_t i = 0; i < len; i++) cmd += (char)data[i];
     cmd.trim();
 
-    // Interpreta comandos de configuracion con el formato SET:nombre=valor
     if (cmd.startsWith("SET:")) {
       int eq = cmd.indexOf('=');
       if (eq > 4) {
@@ -469,12 +465,11 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
       return;
     }
 
-    // Cancelacion automatica si el usuario mete comandos manuales durante la maniobra
+    // Cualquier comando manual durante AUTO cancela
     if (mode == AUTO_PARK && cmd != "PR" && cmd != "PL") {
       abortParking("manual override");
     }
 
-    // Comandos de operacion general y movimiento
     if      (cmd == "PR")    { if (mode == MANUAL) startParking(+1); }
     else if (cmd == "PL")    { if (mode == MANUAL) startParking(-1); }
     else if (cmd == "T")     { mode = (mode == SENSOR_TEST) ? MANUAL : SENSOR_TEST; }
@@ -488,64 +483,56 @@ void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client,
     else if (cmd == "D")     steerRawRight();
     else if (cmd == "C")     steerRawStop();
   }
-  
   if (type == WS_EVT_DISCONNECT) {
     if (mode == AUTO_PARK) abortParking("disc");
     fullStop();
   }
 }
 
-// Inicializacion del sistema
+// =========================================================
+//  SETUP / LOOP
+// =========================================================
 void setup() {
   Serial.begin(115200);
 
-  // Configuracion de pines
   pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
   pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
   pinMode(TRIG_R, OUTPUT); pinMode(ECHO_R, INPUT);
   pinMode(TRIG_L, OUTPUT); pinMode(ECHO_L, INPUT);
   pinMode(TRIG_B, OUTPUT); pinMode(ECHO_B, INPUT);
 
-  // Configuracion de hardware PWM
   ledcSetup(CH_STEER, PWM_FREQ, PWM_RES);
   ledcSetup(CH_DRIVE, PWM_FREQ, PWM_RES);
   ledcAttachPin(ENA, CH_STEER);
   ledcAttachPin(ENB, CH_DRIVE);
 
-  // Calibracion inicial de direccion
   fullStop();
   delay(400);
   steerCalibrateHome();
   steerCenter();
 
-  // Levantar red inalambrica
   WiFi.mode(WIFI_AP);
   WiFi.softAP(ap_ssid, ap_pass);
   Serial.print("IP: "); Serial.println(WiFi.softAPIP());
 
-  // Iniciar servidor
   ws.onEvent(onWsEvent);
   server.addHandler(&ws);
   server.begin();
 
-  // Crear tarea paralela para las luces intermitentes
   xTaskCreatePinnedToCore(hazardTask, "hazard", 2048, NULL, 1, NULL, 0);
 }
 
-// Ciclo principal
 void loop() {
   steerUpdate();
   leerSensores();
   parkingLoop();
 
-  // Envia informacion de telemetria a 5 Hz
   static unsigned long tTel = 0;
   if (millis() - tTel > 200) {
     tTel = millis();
     sendTelemetry();
   }
 
-  // Muestra datos por monitor serie si esta en modo prueba de sensores
   static unsigned long tPrint = 0;
   if (mode == SENSOR_TEST && millis() - tPrint > 500) {
     tPrint = millis();
