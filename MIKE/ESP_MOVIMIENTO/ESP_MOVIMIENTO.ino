@@ -19,7 +19,7 @@ const char* ap_pass = "123456785";
 // (llantas traseras). ENA y ENB reciben la senal PWM de velocidad.
 // Importante: estos numeros deben coincidir con el cableado fisico,
 // porque el LEDC attach al pin ENA/ENB decide a que pin sale el PWM.
-const int IN1 = 11, IN2 = 12, ENA = 8;    // motor de direccion
+const int IN1 = 12, IN2 = 11, ENA = 8;    // motor de direccion
 const int IN3 = 14, IN4 = 13, ENB = 18;   // motor de traccion
 
 // Pines de los tres ultrasonicos HC-SR04. R = derecho, L = izquierdo,
