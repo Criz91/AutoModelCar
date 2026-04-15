@@ -17,8 +17,10 @@ const char* ap_pass = "123456785";
 // Pines del puente H. IN1/IN2/ENA controlan el motor de direccion
 // (llantas delanteras). IN3/IN4/ENB controlan el motor de traccion
 // (llantas traseras). ENA y ENB reciben la senal PWM de velocidad.
-const int IN1 = 12, IN2 = 13, ENA = 18;   // motor de direccion
-const int IN3 = 14, IN4 = 11, ENB = 8;    // motor de traccion
+// Importante: estos numeros deben coincidir con el cableado fisico,
+// porque el LEDC attach al pin ENA/ENB decide a que pin sale el PWM.
+const int IN1 = 11, IN2 = 12, ENA = 8;    // motor de direccion
+const int IN3 = 14, IN4 = 13, ENB = 18;   // motor de traccion
 
 // Pines de los tres ultrasonicos HC-SR04. R = derecho, L = izquierdo,
 // B = trasero. Cada sensor usa un pin TRIG (salida) y uno ECHO (entrada).
