@@ -1,23 +1,25 @@
-import asyncio
 import json
+import socket
 import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-import websockets
-
-ESP32_IP = "192.168.4.1"
-WS_URL = f"ws://{ESP32_IP}/ws"
+# Conexion al ESP32 (puerto TCP que abre el firmware unificado).
+# El reglamento del TMR prohibe comunicacion cableada con procesamiento
+# externo, asi que la GUI siempre se conecta por WiFi al AP del ESP.
+DEFAULT_HOST = "192.168.4.1"
+DEFAULT_PORT = 8080
 
 
 # Lista de sliders de calibracion que aparecen en el panel derecho.
 # Cada entrada es (clave, etiqueta visible, minimo, maximo, valor inicial).
-# La clave es la misma que entiende el firmware en applyParam(),
-# asi al mover el slider se manda "SET:clave=valor" por WebSocket
-# y el ESP32 ajusta el parametro en vivo sin reflashear.
+# La clave es la misma que entiende el firmware en applyParam(), asi al
+# mover el slider se manda "SET:clave=valor" por TCP y el ESP32 ajusta
+# el parametro en vivo sin reflashear.
 SLIDERS = [
     ("driveSpeed",       "Velocidad manual (PWM)",        0,    255,  180),
     ("parkDriveSpeed",   "Velocidad estacionar (PWM)",    0,    255,  200),
+    ("lineFollowSpeed",  "Velocidad line follow (PWM)",   0,    255,  150),
     ("steerSpeed",       "Velocidad direccion (PWM)",     0,    255,  170),
     ("tSteerFullMs",     "Tiempo direccion tope-tope ms", 100,  1500, 400),
     ("steerTrimMs",      "Trim centro direccion ms",     -150,  150,  0),
@@ -45,6 +47,7 @@ STATE_COLORS = {
     "MANUAL":  "#9e9e9e",
     "TEST":    "#42a5f5",
     "AUTO":    "#ffb300",
+    "LF":      "#26c6da",
     "DONE":    "#43a047",
     "ABORT":   "#e53935",
     "?":       "#9e9e9e",
@@ -54,8 +57,8 @@ STATE_COLORS = {
 class CarControllerGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("AutoModelCar - Panel de Control")
-        self.root.geometry("1180x720")
+        self.root.title("AutoModelCar - Panel de Control (TCP)")
+        self.root.geometry("1180x760")
         self.root.configure(bg="#1e1e1e")
 
         style = ttk.Style()
@@ -68,6 +71,7 @@ class CarControllerGUI:
         style.configure("TLabelframe.Label", background="#1e1e1e",
                         foreground="#90caf9", font=("Segoe UI", 10, "bold"))
         style.configure("TFrame", background="#1e1e1e")
+        style.configure("TEntry", fieldbackground="#2a2a2a", foreground="#e0e0e0")
         style.configure("TButton", padding=6, font=("Segoe UI", 9))
         style.configure("Big.TButton", padding=10, font=("Segoe UI", 11, "bold"))
         style.configure("Estop.TButton", padding=14,
@@ -75,19 +79,24 @@ class CarControllerGUI:
                         background="#e53935", foreground="white")
         style.map("Estop.TButton", background=[("active", "#ff5252")])
 
-        self.ws = None
+        # Estado del socket TCP. self.sock vive en el thread del listener;
+        # las escrituras se hacen desde el thread de Tkinter usando un lock.
+        self.sock = None
+        self.sock_lock = threading.Lock()
         self.connected = False
+        self.listener_thread = None
+        self.stop_listener = threading.Event()
+
         self.pressed = set()
+
+        self.host_var = tk.StringVar(value=DEFAULT_HOST)
+        self.port_var = tk.StringVar(value=str(DEFAULT_PORT))
 
         self.slider_vars = {}
         for k, _, _, _, default in SLIDERS:
             self.slider_vars[k] = tk.IntVar(value=default)
 
         self._build_ui()
-
-        self.loop = asyncio.new_event_loop()
-        self.thread = threading.Thread(target=self._run_loop, daemon=True)
-        self.thread.start()
 
         self.root.bind("<KeyPress>", self.on_key_press)
         self.root.bind("<KeyRelease>", self.on_key_release)
@@ -113,16 +122,25 @@ class CarControllerGUI:
         self._build_right (col_right)
 
     def _build_left(self, parent):
-        conn = ttk.LabelFrame(parent, text="Conexion", padding=10)
+        conn = ttk.LabelFrame(parent, text="Conexion (TCP)", padding=10)
         conn.pack(fill="x", pady=(0, 8))
 
-        self.lbl_status = ttk.Label(conn, text="Desconectado",
+        # Fila 1: host:port editables
+        addr_row = ttk.Frame(conn); addr_row.pack(fill="x")
+        ttk.Label(addr_row, text="Host:", width=6).pack(side="left")
+        ttk.Entry(addr_row, textvariable=self.host_var, width=14).pack(side="left", padx=(0,6))
+        ttk.Label(addr_row, text="Puerto:").pack(side="left")
+        ttk.Entry(addr_row, textvariable=self.port_var, width=6).pack(side="left", padx=(4,0))
+
+        # Fila 2: status + botones
+        st_row = ttk.Frame(conn); st_row.pack(fill="x", pady=(8,0))
+        self.lbl_status = ttk.Label(st_row, text="Desconectado",
                                     font=("Segoe UI", 10, "bold"),
                                     foreground="#e57373")
         self.lbl_status.pack(side="left")
 
-        ttk.Button(conn, text="Conectar",    command=self.connect   ).pack(side="right", padx=3)
-        ttk.Button(conn, text="Desconectar", command=self.disconnect).pack(side="right", padx=3)
+        ttk.Button(st_row, text="Conectar",    command=self.connect   ).pack(side="right", padx=3)
+        ttk.Button(st_row, text="Desconectar", command=self.disconnect).pack(side="right", padx=3)
 
         st = ttk.LabelFrame(parent, text="Estado", padding=10)
         st.pack(fill="x", pady=(0, 8))
@@ -137,12 +155,30 @@ class CarControllerGUI:
             10, 58, anchor="w", text="-",
             font=("Segoe UI", 9), fill="white")
 
-        sens = ttk.LabelFrame(parent, text="Sensores (cm)", padding=10)
+        sens = ttk.LabelFrame(parent, text="Ultrasonicos (cm)", padding=10)
         sens.pack(fill="x", pady=(0, 8))
 
         self.lbl_R = self._mk_big_label(sens, "Derecho",   "999")
         self.lbl_L = self._mk_big_label(sens, "Izquierdo", "999")
         self.lbl_B = self._mk_big_label(sens, "Trasero",   "999")
+        self.lbl_F = self._mk_big_label(sens, "Frontal",   "999")
+
+        line = ttk.LabelFrame(parent, text="Seguidores de linea (TCRT5000)", padding=10)
+        line.pack(fill="x", pady=(0, 8))
+        self.line_canvas = tk.Canvas(line, height=46, bg="#1e1e1e",
+                                     highlightthickness=0)
+        self.line_canvas.pack(fill="x")
+        # Tres circulos: izquierdo, centro, derecho
+        self.line_dots = []
+        labels = ["L", "C", "R"]
+        for i, lab in enumerate(labels):
+            x = 40 + i * 80
+            dot = self.line_canvas.create_oval(x-15, 8, x+15, 38,
+                                               fill="#424242", outline="#90caf9", width=2)
+            self.line_canvas.create_text(x, 23, text=lab,
+                                         font=("Segoe UI", 11, "bold"),
+                                         fill="#ffffff")
+            self.line_dots.append(dot)
 
         dr = ttk.LabelFrame(parent, text="Direccion (estimada)", padding=10)
         dr.pack(fill="x", pady=(0, 8))
@@ -203,6 +239,14 @@ class CarControllerGUI:
                    command=lambda: self.send("PR")
                    ).pack(side="left", expand=True, fill="x", padx=2)
 
+        lfrow = ttk.Frame(auto); lfrow.pack(fill="x", pady=3)
+        ttk.Button(lfrow, text="Line Follow ON (LF)", style="Big.TButton",
+                   command=lambda: self.send("LF")
+                   ).pack(side="left", expand=True, fill="x", padx=2)
+        ttk.Button(lfrow, text="Line Follow OFF (NOLF)", style="Big.TButton",
+                   command=lambda: self.send("NOLF")
+                   ).pack(side="left", expand=True, fill="x", padx=2)
+
         urow = ttk.Frame(auto); urow.pack(fill="x", pady=3)
         ttk.Button(urow, text="Sensor Test (T)",
                    command=lambda: self.send("T")
@@ -222,7 +266,7 @@ class CarControllerGUI:
 
         info = ttk.Label(parent,
                          text="Tip: WASD con la ventana enfocada.\n"
-                              "Cualquier tecla durante AUTO cancela.\n"
+                              "Cualquier tecla durante AUTO o LF cancela.\n"
                               "Esc = paro de emergencia.",
                          justify="left", foreground="#9e9e9e")
         info.pack(anchor="w", pady=(8, 0))
@@ -268,69 +312,100 @@ class CarControllerGUI:
                        variable=var, command=on_change)
         sc.pack(fill="x")
 
-    # Loop de asyncio que vive en su propio thread. Toda la
-    # comunicacion WebSocket se programa con run_coroutine_threadsafe
-    # para no bloquear el thread principal de Tkinter.
-    def _run_loop(self):
-        asyncio.set_event_loop(self.loop)
-        self.loop.run_forever()
-
+    # Conexion TCP
+    # El listener vive en un thread dedicado bloqueante. Lee lineas
+    # delimitadas por '\n' del socket y las pasa al handler. El thread
+    # de Tkinter solo escribe (con lock) y se actualiza via root.after.
     def connect(self):
-        asyncio.run_coroutine_threadsafe(self._connect_ws(), self.loop)
-
-    async def _connect_ws(self):
+        if self.connected:
+            return
+        host = self.host_var.get().strip() or DEFAULT_HOST
         try:
-            if self.ws:
-                await self.ws.close()
-            self.ws = await websockets.connect(WS_URL)
-            self.connected = True
-            self._set_status(True)
-            asyncio.ensure_future(self._listen_loop())
+            port = int(self.port_var.get())
+        except ValueError:
+            port = DEFAULT_PORT
+
+        try:
+            s = socket.create_connection((host, port), timeout=3)
+            s.settimeout(None)  # bloqueante despues del connect
         except Exception as e:
-            self.connected = False
-            self.ws = None
             self._set_status(False)
-            self.root.after(0, lambda: messagebox.showerror(
-                "Error", f"No se pudo conectar:\n{e}"))
+            messagebox.showerror("Error", f"No se pudo conectar a {host}:{port}\n{e}")
+            return
 
-    async def _listen_loop(self):
-        try:
-            while self.ws:
-                msg = await self.ws.recv()
-                self._handle_telemetry(msg)
-        except Exception:
-            self.ws = None
-            self.connected = False
-            self._set_status(False)
+        with self.sock_lock:
+            self.sock = s
+        self.connected = True
+        self._set_status(True)
+
+        self.stop_listener.clear()
+        self.listener_thread = threading.Thread(target=self._listen_loop, daemon=True)
+        self.listener_thread.start()
 
     def disconnect(self):
-        asyncio.run_coroutine_threadsafe(self._disconnect_ws(), self.loop)
+        self.stop_listener.set()
+        with self.sock_lock:
+            s = self.sock
+            self.sock = None
+        if s:
+            try:
+                s.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
+            try:
+                s.close()
+            except Exception:
+                pass
+        self.connected = False
+        self._set_status(False)
 
-    async def _disconnect_ws(self):
-        try:
-            if self.ws:
-                await self.ws.close()
-        finally:
-            self.ws = None
-            self.connected = False
-            self._set_status(False)
+    def _listen_loop(self):
+        buf = b""
+        while not self.stop_listener.is_set():
+            with self.sock_lock:
+                s = self.sock
+            if s is None:
+                break
+            try:
+                chunk = s.recv(4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    text = line.decode("utf-8", errors="replace")
+                except Exception:
+                    continue
+                self._handle_message(text)
+
+        # Cerro el remoto o hubo error
+        self.connected = False
+        with self.sock_lock:
+            self.sock = None
+        self._set_status(False)
 
     def send(self, msg: str):
-        asyncio.run_coroutine_threadsafe(self._send(msg), self.loop)
-
-    async def _send(self, msg: str):
-        if not self.ws:
+        with self.sock_lock:
+            s = self.sock
+        if s is None:
             return
         try:
-            await self.ws.send(msg)
-        except Exception:
-            self.ws = None
+            s.sendall((msg + "\n").encode("utf-8"))
+        except OSError:
             self.connected = False
+            with self.sock_lock:
+                self.sock = None
             self._set_status(False)
 
     # Helpers de UI: actualizan widgets desde callbacks de Tkinter.
     # Todo lo que toca widgets se enrutea por root.after para que
-    # corra en el thread principal aunque venga del listener async.
+    # corra en el thread principal aunque venga del listener.
     def _set_status(self, ok: bool):
         def _do():
             if ok:
@@ -339,18 +414,33 @@ class CarControllerGUI:
                 self.lbl_status.config(text="Desconectado", foreground="#e57373")
         self.root.after(0, _do)
 
-    def _handle_telemetry(self, msg):
+    def _handle_message(self, msg):
+        # El firmware manda telemetria como JSON y otras lineas como
+        # texto plano (RX,..., INFO,..., ERR,...). Solo nos interesa
+        # parsear las que empiezan con '{' como JSON.
+        if not msg.startswith("{"):
+            return
         try:
             j = json.loads(msg)
         except Exception:
             return
         if j.get("t") != "tel":
             return
+        self._handle_telemetry(j)
 
+    def _handle_telemetry(self, j):
         def _do():
             self.lbl_R.config(text=str(j.get("R", "?")))
             self.lbl_L.config(text=str(j.get("L", "?")))
             self.lbl_B.config(text=str(j.get("B", "?")))
+            self.lbl_F.config(text=str(j.get("F", "?")))
+
+            # Seguidores de linea: tres circulos. Verde = ve linea blanca.
+            colors = []
+            for key in ("lnL", "lnC", "lnR"):
+                colors.append("#66bb6a" if int(j.get(key, 0)) else "#424242")
+            for dot, col in zip(self.line_dots, colors):
+                self.line_canvas.itemconfig(dot, fill=col)
 
             sp = int(j.get("sp", 0))
             self.lbl_steer_pos.config(text=f"{sp} ms")
@@ -372,9 +462,10 @@ class CarControllerGUI:
     def estop(self):
         self.send("ESTOP")
 
-    # Manejo de teclado. WASD se mandan como comandos individuales
-    # al firmware (igual que los botones), y al soltar la tecla se
-    # envia "X" (parar tracion) o "C" (centrar direccion) segun el caso.
+    # Manejo de teclado
+    # WASD se mandan como comandos individuales al firmware (igual
+    # que los botones), y al soltar la tecla se envia "X" (parar
+    # tracion) o "C" (centrar direccion) segun el caso.
     def on_key_press(self, event):
         k = event.keysym.lower()
         if k in self.pressed:

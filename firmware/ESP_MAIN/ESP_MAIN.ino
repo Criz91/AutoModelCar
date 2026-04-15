@@ -1,52 +1,69 @@
+// AutoModelCar - Firmware unificado ESP32-S3
+// TMR 2026 - Categoria AutoModelCar
+// Tres canales de comunicacion conviven:
+//   - WiFi AP + TCP puerto 8080  -> GUI de la laptop (teleop, tuning, parking)
+//   - UART2 (RX=16, TX=17)       -> Raspberry Pi 5 con Hailo (IA carril)
+//   - Serial USB                  -> debug
+//
+// Modos:
+//   MANUAL       - control manual WASD desde GUI o desde Pi
+//   AUTO_PARK    - maquina de estados de estacionamiento en bateria
+//   LINE_FOLLOW  - sigue linea con TCRT5000, activado por la Pi cuando
+//                  Hailo pierde el carril en una curva cerrada
+//   SENSOR_TEST  - dump de sensores cada 500 ms para depuracion
+
 #include <WiFi.h>
 #include <ArduinoJson.h>
 
-// =====================================================
 // WIFI AP + TCP SERVER
-// =====================================================
-const char* AP_SSID = "ESP32_FOLLADORA";
-const char* AP_PASS = "10203040";
+const char* AP_SSID = "AutoModelCar_TMR26";
+const char* AP_PASS = "tmr2026robot";
 
 WiFiServer tcpServer(8080);
 WiFiClient tcpClients[4];
 String tcpBuffers[4];
 
-// =====================================================
 // UART HACIA RASPBERRY PI
-// =====================================================
 #define UART_RX_PIN 16
 #define UART_TX_PIN 17
 HardwareSerial PiSerial(2);
 String uartBuffer = "";
 
-// =====================================================
 // PINES DEL PUENTE H Y SENSORES
-// =====================================================
-// Direccion
+// Direccion (motor delantero)
 const int IN1 = 12, IN2 = 11, ENA = 8;
 
-// Traccion
+// Traccion (motor trasero)
 const int IN3 = 14, IN4 = 13, ENB = 18;
 
-// Ultrasonicos
-const int TRIG_R = 4,  ECHO_R = 5;
-const int TRIG_L = 6,  ECHO_L = 7;
-const int TRIG_B = 15, ECHO_B = 9;
+// Ultrasonicos HC-SR04
+const int TRIG_R = 4,  ECHO_R = 5;   // derecho
+const int TRIG_L = 6,  ECHO_L = 7;   // izquierdo
+const int TRIG_B = 15, ECHO_B = 9;   // trasero
+const int TRIG_F = 1,  ECHO_F = 2;   // frontal (NUEVO)
+// NOTA: GPIO1 y GPIO2 en ESP32-S3 son GPIO normales (no son UART0 como en
+// ESP32 clasico). Si la placa concreta los expone como strapping pins,
+// reasignar antes de soldar.
 
-// LEDs
+// Seguidores de linea TCRT5000 (digitales, salida del comparador)
+const int LINE_L = 38;   // izquierda
+const int LINE_R = 39;   // derecha
+const int LINE_C = 40;   // centro
+// Polaridad: el modulo MDU-SEN-MH-TCRT5000 entrega LOW cuando ve superficie
+// reflectiva (linea blanca sobre piso negro). Si la pista de tu equipo
+// invierte la polaridad, cambiar LINE_ACTIVE_LOW a 0.
+#define LINE_ACTIVE_LOW 1
+
+// LEDs (intermitentes / hazards)
 const int LED_L = 10, LED_R = 21;
 
-// =====================================================
 // PWM
-// =====================================================
 const int PWM_FREQ = 20000;
 const int PWM_RES  = 8;
 const int CH_STEER = 0;
 const int CH_DRIVE = 1;
 
-// =====================================================
-// PARAMETROS AJUSTABLES
-// =====================================================
+// PARAMETROS AJUSTABLES (sliders del GUI)
 struct Params {
   int driveSpeed         = 180;
   int parkDriveSpeed     = 200;
@@ -72,18 +89,17 @@ struct Params {
   int kickStartPWM       = 240;
   int kickStartMs        = 150;
   int tReversaGiroMs     = 1600;
+
+  // NUEVOS para LINE_FOLLOW
+  int lineFollowSpeed    = 150;  // PWM de traccion durante LF
 };
 Params P;
 
-// =====================================================
 // MODOS
-// =====================================================
-enum Mode { MANUAL, AUTO_PARK, SENSOR_TEST };
+enum Mode { MANUAL, AUTO_PARK, SENSOR_TEST, LINE_FOLLOW };
 volatile Mode mode = MANUAL;
 
-// =====================================================
 // ESTADOS DE ESTACIONADO
-// =====================================================
 enum ParkState {
   IDLE,
   AVANCE_INICIAL,
@@ -103,22 +119,16 @@ unsigned long autoStart  = 0;
 
 int parkSide = +1;  // +1 derecha, -1 izquierda
 
-// =====================================================
 // ESTIMACION DE DIRECCION
-// =====================================================
 int steerPosMs   = 200;
 int steerMoveDir = 0;
 int steerMoveDur = 0;
 unsigned long steerMoveStart = 0;
 
-// =====================================================
 // HAZARDS
-// =====================================================
 volatile int hazardMode = 0;
 
-// =====================================================
-// FILTRO MEDIANA
-// =====================================================
+// FILTRO MEDIANA (5 muestras)
 struct MedianFilter {
   long buf[5] = {999,999,999,999,999};
   int idx = 0;
@@ -144,12 +154,13 @@ struct MedianFilter {
   }
 };
 
-MedianFilter filtR, filtL, filtB;
-volatile long lastR = 999, lastL = 999, lastB = 999;
+MedianFilter filtR, filtL, filtB, filtF;
+volatile long lastR = 999, lastL = 999, lastB = 999, lastF = 999;
 
-// =====================================================
+// Lecturas digitales de los seguidores de linea (1 = ve linea blanca)
+volatile int lnL = 0, lnR = 0, lnC = 0;
+
 // VARIABLES AUTO PARK
-// =====================================================
 int countCarro = 0;
 int countHueco = 0;
 unsigned long huecoT0 = 0;
@@ -159,18 +170,18 @@ unsigned long kickStartT0 = 0;
 bool kickStartActive = false;
 bool kickArmPending = false;
 
-// =====================================================
+// VARIABLES LINE FOLLOW
+int  lfLastSteerTarget = -1;  // -1 = sin objetivo previo, evita refire
+unsigned long lfStart = 0;
+
 // TELEMETRIA Y TIEMPOS
-// =====================================================
 unsigned long lastTelemetryMs = 0;
 const unsigned long TELEMETRY_INTERVAL_MS = 200;
 
 unsigned long lastAnyCmdMs = 0;
 const unsigned long GLOBAL_CMD_TIMEOUT_MS = 1500;
 
-// =====================================================
 // UTILIDADES DE COMUNICACION
-// =====================================================
 void sendToAllTcpClients(const String& msg) {
   for (int i = 0; i < 4; i++) {
     if (tcpClients[i] && tcpClients[i].connected()) {
@@ -193,6 +204,7 @@ String modeToString() {
       return "MANUAL";
     case AUTO_PARK:   return "AUTO";
     case SENSOR_TEST: return "TEST";
+    case LINE_FOLLOW: return "LF";
   }
   return "?";
 }
@@ -214,17 +226,21 @@ String parkStateToString() {
 }
 
 void sendTelemetry() {
-  StaticJsonDocument<256> j;
+  StaticJsonDocument<384> j;
   j["t"]    = "tel";
   j["mode"] = modeToString();
   j["st"]   = parkStateToString();
   j["R"]    = lastR;
   j["L"]    = lastL;
   j["B"]    = lastB;
+  j["F"]    = lastF;
+  j["lnL"]  = lnL;
+  j["lnR"]  = lnR;
+  j["lnC"]  = lnC;
   j["sp"]   = steerPosMs;
   j["side"] = parkSide;
 
-  char buf[256];
+  char buf[384];
   size_t n = serializeJson(j, buf);
 
   Serial.println(buf);
@@ -237,9 +253,7 @@ void sendTelemetry() {
   }
 }
 
-// =====================================================
 // CONTROL DE MOTORES
-// =====================================================
 void setMotor(int in1, int in2, int ch, int speed) {
   int s = constrain(abs(speed), 0, 255);
 
@@ -313,9 +327,7 @@ void fullStop() {
   steerRawStop();
 }
 
-// =====================================================
-// KICK START
-// =====================================================
+// KICK START (vencer friccion estatica del motor parado)
 void armKickStart() {
   kickStartT0 = millis();
   kickStartActive = true;
@@ -343,9 +355,7 @@ void driveReverseKick(int cruise) {
   setMotor(IN3, IN4, CH_DRIVE, -s);
 }
 
-// =====================================================
-// SENSORES
-// =====================================================
+// SENSORES ULTRASONICOS
 long medirCm(int trig, int echo) {
   digitalWrite(trig, LOW);
   delayMicroseconds(2);
@@ -366,15 +376,31 @@ void leerSensores() {
   pushSiValido(filtR, medirCm(TRIG_R, ECHO_R));
   pushSiValido(filtL, medirCm(TRIG_L, ECHO_L));
   pushSiValido(filtB, medirCm(TRIG_B, ECHO_B));
+  pushSiValido(filtF, medirCm(TRIG_F, ECHO_F));
 
   lastR = filtR.get();
   lastL = filtL.get();
   lastB = filtB.get();
+  lastF = filtF.get();
 }
 
-// =====================================================
-// HAZARD TASK
-// =====================================================
+// SEGUIDORES DE LINEA TCRT5000
+inline int readLineSensor(int pin) {
+  int raw = digitalRead(pin);
+#if LINE_ACTIVE_LOW
+  return (raw == LOW) ? 1 : 0;   // LOW = ve linea blanca
+#else
+  return (raw == HIGH) ? 1 : 0;
+#endif
+}
+
+void leerLineas() {
+  lnL = readLineSensor(LINE_L);
+  lnR = readLineSensor(LINE_R);
+  lnC = readLineSensor(LINE_C);
+}
+
+// HAZARD TASK (intermitentes en core 0)
 void hazardTask(void *p) {
   pinMode(LED_L, OUTPUT);
   pinMode(LED_R, OUTPUT);
@@ -429,9 +455,7 @@ void hazardTask(void *p) {
   }
 }
 
-// =====================================================
-// AUTO PARK
-// =====================================================
+// AUTO PARK - maquina de estados
 void abortParking(const char* m) {
   publishLine(String("ABORT,") + m);
   fullStop();
@@ -651,9 +675,79 @@ void parkingLoop() {
   }
 }
 
-// =====================================================
-// PARAMETROS POR COMANDO
-// =====================================================
+// LINE FOLLOW - corrige direccion con TCRT5000
+// La Pi entra a este modo cuando Hailo pierde el carril en una curva
+// cerrada (manda "LF") y sale cuando lo recupera (manda "NOLF"). El bucle
+// de control vive en el ESP a 100 Hz para que no haya delay de USB+Pi.
+//
+// Convencion lnX = 1 significa "este sensor ve la linea blanca".
+// Tabla de decision (centro, izquierdo, derecho):
+//
+//   C=1 L=0 R=0  ->  recto         (steerCenter)
+//   C=1 L=1 R=0  ->  ajuste izq leve
+//   C=1 L=0 R=1  ->  ajuste der leve
+//   C=0 L=1 R=0  ->  girar izq fuerte
+//   C=0 L=0 R=1  ->  girar der fuerte
+//   C=0 L=1 R=1  ->  cruce / interseccion -> mantener
+//   C=0 L=0 R=0  ->  perdio linea -> mantener (muy lento)
+//   C=1 L=1 R=1  ->  parche / mancha -> mantener
+//
+// Velocidad de crucero menor que la manual para tener tiempo de reaccion.
+void startLineFollow() {
+  if (mode == AUTO_PARK) {
+    publishLine("ERR,LF_BLOCKED_BY_AUTO_PARK");
+    return;
+  }
+  publishLine("INFO,LF_START");
+  mode = LINE_FOLLOW;
+  hazardMode = 1;          // intermitente lento, se ve que esta en automatico
+  lfStart = millis();
+  lfLastSteerTarget = -1;
+  armKickStart();
+}
+
+void stopLineFollow(const char* reason) {
+  publishLine(String("INFO,LF_STOP,") + reason);
+  driveStop();
+  hazardMode = 0;
+  mode = MANUAL;
+  lfLastSteerTarget = -1;
+}
+
+void lineFollowLoop() {
+  if (mode != LINE_FOLLOW) return;
+
+  // Tiempo limite de seguridad por si la Pi se cuelga sin mandar NOLF
+  if (millis() - lfStart > 15000UL) {
+    stopLineFollow("watchdog_15s");
+    return;
+  }
+
+  // Avance constante con kick start al inicio
+  driveForwardKick(P.lineFollowSpeed);
+
+  int center  = P.tSteerFullMs / 2 + P.steerTrimMs;
+  int leftFull  = 0;
+  int rightFull = P.tSteerFullMs;
+  int leftSoft  = (int)(P.tSteerFullMs * 0.35);
+  int rightSoft = (int)(P.tSteerFullMs * 0.65);
+
+  int target = lfLastSteerTarget;   // por defecto mantener
+
+  if      ( lnC && !lnL && !lnR) target = center;
+  else if ( lnC &&  lnL && !lnR) target = leftSoft;
+  else if ( lnC && !lnL &&  lnR) target = rightSoft;
+  else if (!lnC &&  lnL && !lnR) target = leftFull;
+  else if (!lnC && !lnL &&  lnR) target = rightFull;
+  // C=0 L=1 R=1 (cruce), C=0 L=0 R=0 (perdido), C=1 L=1 R=1 (parche): mantener
+
+  if (target != lfLastSteerTarget && target >= 0 && !steerBusy()) {
+    steerGoTo(target);
+    lfLastSteerTarget = target;
+  }
+}
+
+// PARAMETROS POR COMANDO (SET:clave=valor)
 void applyParam(const String& k, int v) {
   if      (k=="driveSpeed")        P.driveSpeed        = constrain(v,0,255);
   else if (k=="parkDriveSpeed")    P.parkDriveSpeed    = constrain(v,0,255);
@@ -684,17 +778,17 @@ void applyParam(const String& k, int v) {
   else if (k=="kickStartPWM")      P.kickStartPWM      = constrain(v,100,255);
   else if (k=="kickStartMs")       P.kickStartMs       = constrain(v,0,500);
   else if (k=="tReversaGiroMs")    P.tReversaGiroMs    = constrain(v,200,5000);
+  else if (k=="lineFollowSpeed")   P.lineFollowSpeed   = constrain(v,0,255);
 }
 
-// =====================================================
 // PARSER DE COMANDOS
-// =====================================================
-// Comandos soportados por TCP y UART:
-// W S X A D C
-// PR PL
-// T H CAL ESTOP
-// SET:clave=valor
-// PING
+// Comandos soportados (TCP, UART y Serial USB):
+//   W S X A D C            - movimiento manual
+//   PR PL                  - estacionar derecha / izquierda
+//   LF NOLF                - entrar / salir de line follow
+//   T H CAL ESTOP          - test sensores, hazards, calibrar, paro
+//   SET:clave=valor        - ajustar parametro en vivo
+//   PING                   - heartbeat (responde PONG)
 void handleCommand(String cmd, const String& sourceName) {
   cmd.trim();
   if (cmd.length() == 0) return;
@@ -720,12 +814,23 @@ void handleCommand(String cmd, const String& sourceName) {
     return;
   }
 
+  // Cualquier comando manual durante AUTO_PARK lo cancela
   if (mode == AUTO_PARK && cmd != "PR" && cmd != "PL") {
     abortParking("manual_override");
   }
 
+  // Cualquier comando manual de movimiento durante LF tambien lo cancela
+  if (mode == LINE_FOLLOW &&
+      (cmd == "W" || cmd == "S" || cmd == "X" ||
+       cmd == "A" || cmd == "D" || cmd == "C" ||
+       cmd == "ESTOP")) {
+    stopLineFollow("manual_override");
+  }
+
   if      (cmd == "PR")    { if (mode == MANUAL) startParking(+1); }
   else if (cmd == "PL")    { if (mode == MANUAL) startParking(-1); }
+  else if (cmd == "LF")    { startLineFollow(); }
+  else if (cmd == "NOLF")  { if (mode == LINE_FOLLOW) stopLineFollow("nolf_cmd"); }
   else if (cmd == "T")     { mode = (mode == SENSOR_TEST) ? MANUAL : SENSOR_TEST; publishLine("INFO,MODE," + modeToString()); }
   else if (cmd == "H")     { hazardMode = (hazardMode == 0) ? 1 : 0; publishLine("INFO,HAZARD," + String(hazardMode)); }
   else if (cmd == "CAL")   { steerCalibrateHome(); steerCenter(); publishLine("INFO,CAL_OK"); }
@@ -741,9 +846,7 @@ void handleCommand(String cmd, const String& sourceName) {
   }
 }
 
-// =====================================================
-// TCP
-// =====================================================
+// TCP - servidor para hasta 4 clientes
 void acceptNewClients() {
   if (tcpServer.hasClient()) {
     WiFiClient newClient = tcpServer.available();
@@ -801,9 +904,7 @@ void readTcpCommands() {
   }
 }
 
-// =====================================================
-// UART
-// =====================================================
+// UART - lee comandos de la Raspberry Pi
 void readUARTCommands() {
   while (PiSerial.available()) {
     char c = (char)PiSerial.read();
@@ -821,11 +922,13 @@ void readUARTCommands() {
   }
 }
 
-// =====================================================
-// TIMEOUT DE SEGURIDAD
-// =====================================================
+// TIMEOUT DE SEGURIDAD GLOBAL
+// Si no llega ningun comando en 1.5 s, frena. NO se aplica durante
+// AUTO_PARK ni durante LINE_FOLLOW (esos modos son autonomos y no
+// dependen de comandos externos continuos).
 void handleGlobalTimeout() {
-  if (mode == AUTO_PARK) return;
+  if (mode == AUTO_PARK)   return;
+  if (mode == LINE_FOLLOW) return;
 
   unsigned long now = millis();
   if (now - lastAnyCmdMs > GLOBAL_CMD_TIMEOUT_MS) {
@@ -834,9 +937,7 @@ void handleGlobalTimeout() {
   }
 }
 
-// =====================================================
 // SETUP
-// =====================================================
 void setup() {
   Serial.begin(115200);
   delay(500);
@@ -850,6 +951,11 @@ void setup() {
   pinMode(TRIG_R, OUTPUT); pinMode(ECHO_R, INPUT);
   pinMode(TRIG_L, OUTPUT); pinMode(ECHO_L, INPUT);
   pinMode(TRIG_B, OUTPUT); pinMode(ECHO_B, INPUT);
+  pinMode(TRIG_F, OUTPUT); pinMode(ECHO_F, INPUT);
+
+  pinMode(LINE_L, INPUT);
+  pinMode(LINE_R, INPUT);
+  pinMode(LINE_C, INPUT);
 
   ledcSetup(CH_STEER, PWM_FREQ, PWM_RES);
   ledcSetup(CH_DRIVE, PWM_FREQ, PWM_RES);
@@ -894,12 +1000,11 @@ void setup() {
   publishLine("INFO,MODE,MANUAL");
 }
 
-// =====================================================
-// LOOP
-// =====================================================
+// LOOP PRINCIPAL (~100 Hz)
 void loop() {
   steerUpdate();
   leerSensores();
+  leerLineas();
 
   acceptNewClients();
   cleanupClients();
@@ -907,6 +1012,7 @@ void loop() {
   readUARTCommands();
 
   parkingLoop();
+  lineFollowLoop();
   handleGlobalTimeout();
 
   if (millis() - lastTelemetryMs >= TELEMETRY_INTERVAL_MS) {
@@ -917,8 +1023,10 @@ void loop() {
   static unsigned long tPrint = 0;
   if (mode == SENSOR_TEST && millis() - tPrint > 500) {
     tPrint = millis();
-    Serial.printf("R:%ld  L:%ld  B:%ld\n", lastR, lastL, lastB);
-    PiSerial.printf("R:%ld  L:%ld  B:%ld\n", lastR, lastL, lastB);
+    Serial.printf("R:%ld  L:%ld  B:%ld  F:%ld  ln:%d%d%d\n",
+                  lastR, lastL, lastB, lastF, lnL, lnC, lnR);
+    PiSerial.printf("R:%ld  L:%ld  B:%ld  F:%ld  ln:%d%d%d\n",
+                    lastR, lastL, lastB, lastF, lnL, lnC, lnR);
   }
 
   delay(10);
