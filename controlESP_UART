@@ -1,569 +1,925 @@
-import json
-import socket
-import threading
-import tkinter as tk
-from tkinter import ttk, messagebox
+#include <WiFi.h>
+#include <ArduinoJson.h>
 
+// =====================================================
+// WIFI AP + TCP SERVER
+// =====================================================
+const char* AP_SSID = "ESP32_FOLLADORA";
+const char* AP_PASS = "10203040";
 
-ESP32_IP = "192.168.4.1"
-TCP_PORT = 8080
+WiFiServer tcpServer(8080);
+WiFiClient tcpClients[4];
+String tcpBuffers[4];
 
-SLIDERS = [
-    ("driveSpeed",       "Velocidad manual (PWM)",        0,    255,  180),
-    ("parkDriveSpeed",   "Velocidad estacionar (PWM)",    0,    255,  200),
-    ("steerSpeed",       "Velocidad direccion (PWM)",     0,    255,  170),
-    ("tSteerFullMs",     "Tiempo direccion tope-tope ms", 100,  1500, 400),
-    ("steerTrimMs",      "Trim centro direccion ms",     -150,  150,  0),
-    ("tAvanceInicialMs", "Override avance inicial (ms)",  0,    10000, 0),
-    ("distCarroCm",      "Dist. ve carro (<) cm",         5,    100,  25),
-    ("distHuecoCm",      "Dist. ve hueco (>) cm",         10,   200,  45),
-    ("distFrenaSuaveCm", "Dist. frena suave (banqueta)",  3,    50,   15),
-    ("distParaYaCm",     "Dist. para ya (banqueta)",      2,    30,   8),
-    ("tAvanzarHuecoMs",  "Override avance tras hueco ms", 0,    5000, 0),
-    ("minHuecoStableMs", "Hueco estable min (ms)",        0,    2000, 250),
-    ("carLargoCm",       "Largo del carro (cm)",          5,    100,  29),
-    ("carAnchoCm",       "Ancho del carro (cm)",          5,    50,   14),
-    ("carAltoCm",        "Alto del carro (cm)",           5,    50,   25),
-    ("margenHuecoCm",    "Margen lateral hueco (cm)",     0,    30,   6),
-    ("margenBanquetaCm", "Margen banqueta (cm)",          0,    20,   4),
-    ("cmPorSegPark",     "Velocidad parking (cm/s)",      5,    200,  30),
-    ("distInicialCm",    "Avance inicial (cm)",           20,   300,  100),
-    ("kickStartPWM",     "Kick-start PWM",                100,  255,  240),
-    ("kickStartMs",      "Kick-start duracion (ms)",      0,    500,  150),
-    ("tReversaGiroMs",   "Tiempo reversa con giro (ms)",  200,  5000, 1600),
-]
+// =====================================================
+// UART HACIA RASPBERRY PI
+// =====================================================
+#define UART_RX_PIN 16
+#define UART_TX_PIN 17
+HardwareSerial PiSerial(2);
+String uartBuffer = "";
 
-STATE_COLORS = {
-    "MANUAL": "#9e9e9e",
-    "TEST":   "#42a5f5",
-    "AUTO":   "#ffb300",
-    "DONE":   "#43a047",
-    "ABORT":  "#e53935",
-    "?":      "#9e9e9e",
+// =====================================================
+// PINES DEL PUENTE H Y SENSORES
+// =====================================================
+// Direccion
+const int IN1 = 12, IN2 = 11, ENA = 8;
+
+// Traccion
+const int IN3 = 14, IN4 = 13, ENB = 18;
+
+// Ultrasonicos
+const int TRIG_R = 4,  ECHO_R = 5;
+const int TRIG_L = 6,  ECHO_L = 7;
+const int TRIG_B = 15, ECHO_B = 9;
+
+// LEDs
+const int LED_L = 10, LED_R = 21;
+
+// =====================================================
+// PWM
+// =====================================================
+const int PWM_FREQ = 20000;
+const int PWM_RES  = 8;
+const int CH_STEER = 0;
+const int CH_DRIVE = 1;
+
+// =====================================================
+// PARAMETROS AJUSTABLES
+// =====================================================
+struct Params {
+  int driveSpeed         = 180;
+  int parkDriveSpeed     = 200;
+  int steerSpeed         = 170;
+  int tSteerFullMs       = 400;
+  int steerTrimMs        = 0;
+  int distCarroCm        = 25;
+  int distHuecoCm        = 45;
+  int distFrenaSuaveCm   = 15;
+  int distParaYaCm       = 8;
+  int tAvanceInicialMs   = 0;
+  int tAvanzarHuecoMs    = 0;
+  int minHuecoStableMs   = 250;
+  int maxAutoMs          = 60000;
+
+  int carLargoCm         = 29;
+  int carAnchoCm         = 14;
+  int carAltoCm          = 25;
+  int margenHuecoCm      = 6;
+  int margenBanquetaCm   = 4;
+  int cmPorSegPark       = 30;
+  int distInicialCm      = 100;
+  int kickStartPWM       = 240;
+  int kickStartMs        = 150;
+  int tReversaGiroMs     = 1600;
+};
+Params P;
+
+// =====================================================
+// MODOS
+// =====================================================
+enum Mode { MANUAL, AUTO_PARK, SENSOR_TEST };
+volatile Mode mode = MANUAL;
+
+// =====================================================
+// ESTADOS DE ESTACIONADO
+// =====================================================
+enum ParkState {
+  IDLE,
+  AVANCE_INICIAL,
+  MEDIR_HUECO,
+  AVANZAR_PASA_HUECO,
+  STOP_Y_GIRAR,
+  REVERSA_GIRO,
+  STOP_Y_ENDEREZAR,
+  REVERSA_RECTA,
+  ESTACIONADO,
+  ABORTADO
+};
+
+ParkState parkState = IDLE;
+unsigned long stateStart = 0;
+unsigned long autoStart  = 0;
+
+int parkSide = +1;  // +1 derecha, -1 izquierda
+
+// =====================================================
+// ESTIMACION DE DIRECCION
+// =====================================================
+int steerPosMs   = 200;
+int steerMoveDir = 0;
+int steerMoveDur = 0;
+unsigned long steerMoveStart = 0;
+
+// =====================================================
+// HAZARDS
+// =====================================================
+volatile int hazardMode = 0;
+
+// =====================================================
+// FILTRO MEDIANA
+// =====================================================
+struct MedianFilter {
+  long buf[5] = {999,999,999,999,999};
+  int idx = 0;
+
+  void push(long v) {
+    buf[idx] = v;
+    idx = (idx + 1) % 5;
+  }
+
+  long get() {
+    long s[5];
+    for (int i = 0; i < 5; i++) s[i] = buf[i];
+    for (int i = 0; i < 4; i++) {
+      for (int j = i + 1; j < 5; j++) {
+        if (s[i] > s[j]) {
+          long t = s[i];
+          s[i] = s[j];
+          s[j] = t;
+        }
+      }
+    }
+    return s[2];
+  }
+};
+
+MedianFilter filtR, filtL, filtB;
+volatile long lastR = 999, lastL = 999, lastB = 999;
+
+// =====================================================
+// VARIABLES AUTO PARK
+// =====================================================
+int countCarro = 0;
+int countHueco = 0;
+unsigned long huecoT0 = 0;
+unsigned long huecoLastT = 0;
+int huecoLargoCm = 0;
+unsigned long kickStartT0 = 0;
+bool kickStartActive = false;
+bool kickArmPending = false;
+
+// =====================================================
+// TELEMETRIA Y TIEMPOS
+// =====================================================
+unsigned long lastTelemetryMs = 0;
+const unsigned long TELEMETRY_INTERVAL_MS = 200;
+
+unsigned long lastAnyCmdMs = 0;
+const unsigned long GLOBAL_CMD_TIMEOUT_MS = 1500;
+
+// =====================================================
+// UTILIDADES DE COMUNICACION
+// =====================================================
+void sendToAllTcpClients(const String& msg) {
+  for (int i = 0; i < 4; i++) {
+    if (tcpClients[i] && tcpClients[i].connected()) {
+      tcpClients[i].println(msg);
+    }
+  }
 }
 
-
-class CarControllerGUI:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("AutoModelCar - Panel TCP")
-        self.root.geometry("1180x720")
-        self.root.configure(bg="#1e1e1e")
-
-        style = ttk.Style()
-        style.theme_use("clam")
-        style.configure(
-            ".",
-            background="#1e1e1e",
-            foreground="#e0e0e0",
-            fieldbackground="#2a2a2a"
-        )
-        style.configure("TLabel", background="#1e1e1e", foreground="#e0e0e0")
-        style.configure("TLabelframe", background="#1e1e1e", foreground="#e0e0e0")
-        style.configure(
-            "TLabelframe.Label",
-            background="#1e1e1e",
-            foreground="#90caf9",
-            font=("Segoe UI", 10, "bold")
-        )
-        style.configure("TFrame", background="#1e1e1e")
-        style.configure("TButton", padding=6, font=("Segoe UI", 9))
-        style.configure("Big.TButton", padding=10, font=("Segoe UI", 11, "bold"))
-        style.configure(
-            "Estop.TButton",
-            padding=14,
-            font=("Segoe UI", 13, "bold"),
-            background="#e53935",
-            foreground="white"
-        )
-        style.map("Estop.TButton", background=[("active", "#ff5252")])
-
-        self.sock = None
-        self.sock_file = None
-        self.connected = False
-        self.running = False
-        self.listener_thread = None
-        self.pressed = set()
-        self.send_lock = threading.Lock()
-
-        self.slider_vars = {}
-        for k, _, _, _, default in SLIDERS:
-            self.slider_vars[k] = tk.IntVar(value=default)
-
-        self._build_ui()
-
-        self.root.bind("<KeyPress>", self.on_key_press)
-        self.root.bind("<KeyRelease>", self.on_key_release)
-        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-
-    def _build_ui(self):
-        outer = ttk.Frame(self.root, padding=10)
-        outer.pack(fill="both", expand=True)
-
-        outer.columnconfigure(0, weight=1, uniform="col")
-        outer.columnconfigure(1, weight=1, uniform="col")
-        outer.columnconfigure(2, weight=1, uniform="col")
-        outer.rowconfigure(0, weight=1)
-
-        col_left = ttk.Frame(outer)
-        col_left.grid(row=0, column=0, sticky="nsew", padx=4)
-
-        col_mid = ttk.Frame(outer)
-        col_mid.grid(row=0, column=1, sticky="nsew", padx=4)
-
-        col_right = ttk.Frame(outer)
-        col_right.grid(row=0, column=2, sticky="nsew", padx=4)
-
-        self._build_left(col_left)
-        self._build_mid(col_mid)
-        self._build_right(col_right)
-
-    def _build_left(self, parent):
-        conn = ttk.LabelFrame(parent, text="Conexion TCP", padding=10)
-        conn.pack(fill="x", pady=(0, 8))
-
-        self.lbl_status = ttk.Label(
-            conn,
-            text="Desconectado",
-            font=("Segoe UI", 10, "bold"),
-            foreground="#e57373"
-        )
-        self.lbl_status.pack(side="left")
-
-        ttk.Button(conn, text="Conectar", command=self.connect).pack(side="right", padx=3)
-        ttk.Button(conn, text="Desconectar", command=self.disconnect).pack(side="right", padx=3)
-
-        info = ttk.Label(
-            conn,
-            text=f"{ESP32_IP}:{TCP_PORT}",
-            foreground="#9e9e9e"
-        )
-        info.pack(side="bottom", anchor="w", pady=(6, 0))
-
-        st = ttk.LabelFrame(parent, text="Estado", padding=10)
-        st.pack(fill="x", pady=(0, 8))
-
-        self.state_canvas = tk.Canvas(
-            st,
-            height=70,
-            bg="#9e9e9e",
-            highlightthickness=0
-        )
-        self.state_canvas.pack(fill="x")
-
-        self.state_text = self.state_canvas.create_text(
-            10, 35,
-            anchor="w",
-            text="MANUAL",
-            font=("Segoe UI", 18, "bold"),
-            fill="white"
-        )
-        self.substate_text = self.state_canvas.create_text(
-            10, 58,
-            anchor="w",
-            text="-",
-            font=("Segoe UI", 9),
-            fill="white"
-        )
-
-        sens = ttk.LabelFrame(parent, text="Sensores (cm)", padding=10)
-        sens.pack(fill="x", pady=(0, 8))
-
-        self.lbl_R = self._mk_big_label(sens, "Derecho", "999")
-        self.lbl_L = self._mk_big_label(sens, "Izquierdo", "999")
-        self.lbl_B = self._mk_big_label(sens, "Trasero", "999")
-
-        dr = ttk.LabelFrame(parent, text="Direccion (estimada)", padding=10)
-        dr.pack(fill="x", pady=(0, 8))
-
-        self.lbl_steer_pos = ttk.Label(
-            dr,
-            text="200 ms",
-            font=("Segoe UI", 12, "bold")
-        )
-        self.lbl_steer_pos.pack(anchor="w")
-
-        self.steer_bar = tk.Canvas(dr, height=20, bg="#2a2a2a", highlightthickness=0)
-        self.steer_bar.pack(fill="x", pady=(4, 0))
-
-        self.steer_bar_rect = self.steer_bar.create_rectangle(
-            0, 0, 0, 20, fill="#42a5f5", width=0
-        )
-
-        logf = ttk.LabelFrame(parent, text="Ultimo mensaje", padding=10)
-        logf.pack(fill="both", expand=True, pady=(0, 8))
-
-        self.txt_log = tk.Text(
-            logf,
-            height=12,
-            bg="#111111",
-            fg="#d0d0d0",
-            insertbackground="white",
-            relief="flat",
-            wrap="word"
-        )
-        self.txt_log.pack(fill="both", expand=True)
-        self.txt_log.config(state="disabled")
-
-    def _mk_big_label(self, parent, name, initial):
-        row = ttk.Frame(parent)
-        row.pack(fill="x", pady=2)
-        ttk.Label(row, text=name + ":", width=10).pack(side="left")
-        lbl = ttk.Label(
-            row,
-            text=initial,
-            font=("Consolas", 16, "bold"),
-            foreground="#90caf9"
-        )
-        lbl.pack(side="left")
-        return lbl
-
-    def _build_mid(self, parent):
-        ctrl = ttk.LabelFrame(parent, text="Control manual (WASD)", padding=10)
-        ctrl.pack(fill="x", pady=(0, 8))
-
-        row1 = ttk.Frame(ctrl)
-        row1.pack(fill="x", pady=3)
-
-        ttk.Button(
-            row1, text="W\nForward", style="Big.TButton",
-            command=lambda: self.send("W")
-        ).pack(side="left", expand=True, fill="both", padx=2)
-
-        ttk.Button(
-            row1, text="X\nStop", style="Big.TButton",
-            command=lambda: self.send("X")
-        ).pack(side="left", expand=True, fill="both", padx=2)
-
-        ttk.Button(
-            row1, text="S\nReverse", style="Big.TButton",
-            command=lambda: self.send("S")
-        ).pack(side="left", expand=True, fill="both", padx=2)
-
-        row2 = ttk.Frame(ctrl)
-        row2.pack(fill="x", pady=3)
-
-        ttk.Button(
-            row2, text="A\nLeft", style="Big.TButton",
-            command=lambda: self.send("A")
-        ).pack(side="left", expand=True, fill="both", padx=2)
-
-        ttk.Button(
-            row2, text="C\nCenter", style="Big.TButton",
-            command=lambda: self.send("C")
-        ).pack(side="left", expand=True, fill="both", padx=2)
-
-        ttk.Button(
-            row2, text="D\nRight", style="Big.TButton",
-            command=lambda: self.send("D")
-        ).pack(side="left", expand=True, fill="both", padx=2)
-
-        auto = ttk.LabelFrame(parent, text="Modo autonomo", padding=10)
-        auto.pack(fill="x", pady=(0, 8))
-
-        prow = ttk.Frame(auto)
-        prow.pack(fill="x", pady=3)
-
-        ttk.Button(
-            prow, text="Estacionar IZQUIERDA", style="Big.TButton",
-            command=lambda: self.send("PL")
-        ).pack(side="left", expand=True, fill="x", padx=2)
-
-        ttk.Button(
-            prow, text="Estacionar DERECHA", style="Big.TButton",
-            command=lambda: self.send("PR")
-        ).pack(side="left", expand=True, fill="x", padx=2)
-
-        urow = ttk.Frame(auto)
-        urow.pack(fill="x", pady=3)
-
-        ttk.Button(
-            urow, text="Sensor Test (T)",
-            command=lambda: self.send("T")
-        ).pack(side="left", expand=True, fill="x", padx=2)
-
-        ttk.Button(
-            urow, text="Hazards (H)",
-            command=lambda: self.send("H")
-        ).pack(side="left", expand=True, fill="x", padx=2)
-
-        ttk.Button(
-            urow, text="Recalibrar (CAL)",
-            command=lambda: self.send("CAL")
-        ).pack(side="left", expand=True, fill="x", padx=2)
-
-        estop = ttk.Frame(parent)
-        estop.pack(fill="x", pady=(8, 0))
-
-        ttk.Button(
-            estop,
-            text="PARO DE EMERGENCIA",
-            style="Estop.TButton",
-            command=self.estop
-        ).pack(fill="x", ipady=6)
-
-        info = ttk.Label(
-            parent,
-            text="Tip: WASD con la ventana enfocada.\n"
-                 "Cualquier tecla durante AUTO cancela.\n"
-                 "Esc = paro de emergencia.",
-            justify="left",
-            foreground="#9e9e9e"
-        )
-        info.pack(anchor="w", pady=(8, 0))
-
-    def _build_right(self, parent):
-        cal = ttk.LabelFrame(parent, text="Calibracion en vivo", padding=10)
-        cal.pack(fill="both", expand=True)
-
-        canvas = tk.Canvas(cal, bg="#1e1e1e", highlightthickness=0)
-        sb = ttk.Scrollbar(cal, orient="vertical", command=canvas.yview)
-        inner = ttk.Frame(canvas)
-
-        inner.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
-        canvas.create_window((0, 0), window=inner, anchor="nw")
-        canvas.configure(yscrollcommand=sb.set)
-
-        canvas.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
-
-        for key, label, mn, mx, default in SLIDERS:
-            self._mk_slider(inner, key, label, mn, mx, default)
-
-    def _mk_slider(self, parent, key, label, mn, mx, default):
-        frm = ttk.Frame(parent)
-        frm.pack(fill="x", pady=4)
-
-        head = ttk.Frame(frm)
-        head.pack(fill="x")
-
-        ttk.Label(head, text=label, font=("Segoe UI", 9)).pack(side="left")
-
-        val_lbl = ttk.Label(
-            head,
-            text=str(default),
-            font=("Consolas", 10, "bold"),
-            foreground="#90caf9",
-            width=6,
-            anchor="e"
-        )
-        val_lbl.pack(side="right")
-
-        var = self.slider_vars[key]
-
-        def on_change(_e=None):
-            v = int(float(var.get()))
-            val_lbl.config(text=str(v))
-            self.send(f"SET:{key}={v}")
-
-        sc = ttk.Scale(
-            frm,
-            from_=mn,
-            to=mx,
-            orient="horizontal",
-            variable=var,
-            command=on_change
-        )
-        sc.pack(fill="x")
-
-    def connect(self):
-        if self.connected:
-            return
-
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(5.0)
-            sock.connect((ESP32_IP, TCP_PORT))
-            sock.settimeout(None)
-
-            self.sock = sock
-            self.sock_file = sock.makefile("r", encoding="utf-8", newline="\n")
-            self.connected = True
-            self.running = True
-
-            self._set_status(True)
-            self._append_log("Conectado por TCP")
-
-            self.listener_thread = threading.Thread(
-                target=self._listen_loop,
-                daemon=True
-            )
-            self.listener_thread.start()
-
-        except Exception as e:
-            self.connected = False
-            self.running = False
-            self.sock = None
-            self.sock_file = None
-            self._set_status(False)
-            messagebox.showerror("Error", f"No se pudo conectar:\n{e}")
-
-    def disconnect(self):
-        self.running = False
-        self.connected = False
-
-        try:
-            if self.sock_file:
-                self.sock_file.close()
-        except Exception:
-            pass
-
-        try:
-            if self.sock:
-                self.sock.close()
-        except Exception:
-            pass
-
-        self.sock_file = None
-        self.sock = None
-        self._set_status(False)
-        self._append_log("Desconectado")
-
-    def _listen_loop(self):
-        try:
-            while self.running and self.sock_file:
-                line = self.sock_file.readline()
-                if not line:
-                    break
-
-                msg = line.strip()
-                if not msg:
-                    continue
-
-                self._append_log_threadsafe(msg)
-                self._handle_message(msg)
-
-        except Exception as e:
-            self._append_log_threadsafe(f"Error de recepcion: {e}")
-        finally:
-            self.root.after(0, self._connection_lost)
-
-    def _connection_lost(self):
-        if self.connected:
-            self._append_log("Conexion cerrada")
-        self.connected = False
-        self.running = False
-
-        try:
-            if self.sock_file:
-                self.sock_file.close()
-        except Exception:
-            pass
-
-        try:
-            if self.sock:
-                self.sock.close()
-        except Exception:
-            pass
-
-        self.sock_file = None
-        self.sock = None
-        self._set_status(False)
-
-    def send(self, msg: str):
-        if not self.connected or not self.sock:
-            return
-
-        try:
-            data = (msg + "\n").encode("utf-8")
-            with self.send_lock:
-                self.sock.sendall(data)
-            self._append_log(f"> {msg}")
-        except Exception:
-            self._connection_lost()
-
-    def _handle_message(self, msg: str):
-        try:
-            j = json.loads(msg)
-            if j.get("t") == "tel":
-                self._handle_telemetry(j)
-                return
-        except Exception:
-            pass
-
-    def _handle_telemetry(self, j: dict):
-        def _do():
-            self.lbl_R.config(text=str(j.get("R", "?")))
-            self.lbl_L.config(text=str(j.get("L", "?")))
-            self.lbl_B.config(text=str(j.get("B", "?")))
-
-            sp = int(j.get("sp", 0))
-            self.lbl_steer_pos.config(text=f"{sp} ms")
-
-            tmax = self.slider_vars["tSteerFullMs"].get() or 400
-            ratio = max(0.0, min(1.0, sp / float(tmax)))
-            w = self.steer_bar.winfo_width()
-            self.steer_bar.coords(self.steer_bar_rect, 0, 0, w * ratio, 20)
-
-            mode = j.get("mode", "?")
-            sub = j.get("st", "-")
-            color = STATE_COLORS.get(mode, "#9e9e9e")
-
-            self.state_canvas.config(bg=color)
-            self.state_canvas.itemconfig(self.state_text, text=mode)
-            self.state_canvas.itemconfig(self.substate_text, text=sub)
-
-        self.root.after(0, _do)
-
-    def _set_status(self, ok: bool):
-        def _do():
-            if ok:
-                self.lbl_status.config(text="Conectado", foreground="#81c784")
-            else:
-                self.lbl_status.config(text="Desconectado", foreground="#e57373")
-        self.root.after(0, _do)
-
-    def _append_log(self, text: str):
-        self.txt_log.config(state="normal")
-        self.txt_log.insert("end", text + "\n")
-        self.txt_log.see("end")
-        self.txt_log.config(state="disabled")
-
-    def _append_log_threadsafe(self, text: str):
-        self.root.after(0, lambda: self._append_log(text))
-
-    def estop(self):
-        self.send("ESTOP")
-
-    def on_key_press(self, event):
-        k = event.keysym.lower()
-        if k in self.pressed:
-            return
-        self.pressed.add(k)
-
-        if k == "w":
-            self.send("W")
-        elif k == "s":
-            self.send("S")
-        elif k == "a":
-            self.send("A")
-        elif k == "d":
-            self.send("D")
-        elif k == "escape":
-            self.estop()
-
-    def on_key_release(self, event):
-        k = event.keysym.lower()
-        self.pressed.discard(k)
-
-        if k in ("w", "s"):
-            self.send("X")
-        if k in ("a", "d"):
-            self.send("C")
-
-    def on_close(self):
-        try:
-            self.estop()
-        except Exception:
-            pass
-        self.disconnect()
-        self.root.destroy()
-
-
-if __name__ == "__main__":
-    root = tk.Tk()
-    app = CarControllerGUI(root)
-    root.mainloop()
+void publishLine(const String& msg) {
+  Serial.println(msg);
+  PiSerial.println(msg);
+  sendToAllTcpClients(msg);
+}
+
+String modeToString() {
+  switch (mode) {
+    case MANUAL:
+      if (parkState == ESTACIONADO) return "DONE";
+      if (parkState == ABORTADO) return "ABORT";
+      return "MANUAL";
+    case AUTO_PARK:   return "AUTO";
+    case SENSOR_TEST: return "TEST";
+  }
+  return "?";
+}
+
+String parkStateToString() {
+  switch (parkState) {
+    case IDLE:               return "IDLE";
+    case AVANCE_INICIAL:     return "AVANCE_INI";
+    case MEDIR_HUECO:        return "MEDIR_HUECO";
+    case AVANZAR_PASA_HUECO: return "AVANZAR";
+    case STOP_Y_GIRAR:       return "GIRAR";
+    case REVERSA_GIRO:       return "REV_GIRO";
+    case STOP_Y_ENDEREZAR:   return "ENDEREZAR";
+    case REVERSA_RECTA:      return "REV_RECTA";
+    case ESTACIONADO:        return "OK";
+    case ABORTADO:           return "ABORT";
+  }
+  return "?";
+}
+
+void sendTelemetry() {
+  StaticJsonDocument<256> j;
+  j["t"]    = "tel";
+  j["mode"] = modeToString();
+  j["st"]   = parkStateToString();
+  j["R"]    = lastR;
+  j["L"]    = lastL;
+  j["B"]    = lastB;
+  j["sp"]   = steerPosMs;
+  j["side"] = parkSide;
+
+  char buf[256];
+  size_t n = serializeJson(j, buf);
+
+  Serial.println(buf);
+  PiSerial.println(buf);
+  for (int i = 0; i < 4; i++) {
+    if (tcpClients[i] && tcpClients[i].connected()) {
+      tcpClients[i].write((const uint8_t*)buf, n);
+      tcpClients[i].write('\n');
+    }
+  }
+}
+
+// =====================================================
+// CONTROL DE MOTORES
+// =====================================================
+void setMotor(int in1, int in2, int ch, int speed) {
+  int s = constrain(abs(speed), 0, 255);
+
+  if (speed > 0) {
+    digitalWrite(in1, HIGH);
+    digitalWrite(in2, LOW);
+  } else if (speed < 0) {
+    digitalWrite(in1, LOW);
+    digitalWrite(in2, HIGH);
+  } else {
+    digitalWrite(in1, LOW);
+    digitalWrite(in2, LOW);
+  }
+
+  ledcWrite(ch, s);
+}
+
+void driveForward(int s = -1) { setMotor(IN3, IN4, CH_DRIVE, +(s < 0 ? P.driveSpeed : s)); }
+void driveReverse(int s = -1) { setMotor(IN3, IN4, CH_DRIVE, -(s < 0 ? P.driveSpeed : s)); }
+void driveStop()              { setMotor(IN3, IN4, CH_DRIVE, 0); }
+
+void steerRawLeft()  { setMotor(IN1, IN2, CH_STEER, -P.steerSpeed); steerMoveDir = 0; }
+void steerRawRight() { setMotor(IN1, IN2, CH_STEER, +P.steerSpeed); steerMoveDir = 0; }
+void steerRawStop()  { setMotor(IN1, IN2, CH_STEER, 0);             steerMoveDir = 0; }
+
+void steerTimed(int dir, int durMs) {
+  steerMoveDir = dir;
+  steerMoveDur = durMs;
+  steerMoveStart = millis();
+
+  if (dir > 0)      setMotor(IN1, IN2, CH_STEER, +P.steerSpeed);
+  else if (dir < 0) setMotor(IN1, IN2, CH_STEER, -P.steerSpeed);
+}
+
+bool steerBusy() {
+  return steerMoveDir != 0;
+}
+
+void steerUpdate() {
+  if (steerMoveDir == 0) return;
+
+  unsigned long el = millis() - steerMoveStart;
+  if (el >= (unsigned long)steerMoveDur) {
+    steerPosMs = constrain(steerPosMs + steerMoveDir * (int)el, 0, P.tSteerFullMs);
+    setMotor(IN1, IN2, CH_STEER, 0);
+    steerMoveDir = 0;
+  }
+}
+
+void steerGoTo(int targetMs) {
+  targetMs = constrain(targetMs, 0, P.tSteerFullMs);
+  int d = targetMs - steerPosMs;
+  if (d == 0) return;
+  steerTimed(d > 0 ? +1 : -1, abs(d));
+}
+
+void steerCenter()    { steerGoTo(P.tSteerFullMs / 2 + P.steerTrimMs); }
+void steerFullLeft()  { steerGoTo(0); }
+void steerFullRight() { steerGoTo(P.tSteerFullMs); }
+
+void steerCalibrateHome() {
+  setMotor(IN1, IN2, CH_STEER, -P.steerSpeed);
+  delay(P.tSteerFullMs + 250);
+  setMotor(IN1, IN2, CH_STEER, 0);
+  steerPosMs = 0;
+  steerMoveDir = 0;
+}
+
+void fullStop() {
+  driveStop();
+  steerRawStop();
+}
+
+// =====================================================
+// KICK START
+// =====================================================
+void armKickStart() {
+  kickStartT0 = millis();
+  kickStartActive = true;
+}
+
+void driveForwardKick(int cruise) {
+  int s;
+  if (kickStartActive && (millis() - kickStartT0) < (unsigned long)P.kickStartMs) {
+    s = P.kickStartPWM;
+  } else {
+    kickStartActive = false;
+    s = cruise;
+  }
+  setMotor(IN3, IN4, CH_DRIVE, +s);
+}
+
+void driveReverseKick(int cruise) {
+  int s;
+  if (kickStartActive && (millis() - kickStartT0) < (unsigned long)P.kickStartMs) {
+    s = P.kickStartPWM;
+  } else {
+    kickStartActive = false;
+    s = cruise;
+  }
+  setMotor(IN3, IN4, CH_DRIVE, -s);
+}
+
+// =====================================================
+// SENSORES
+// =====================================================
+long medirCm(int trig, int echo) {
+  digitalWrite(trig, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trig, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trig, LOW);
+
+  long dur = pulseIn(echo, HIGH, 25000);
+  if (dur == 0) return 999;
+  return dur * 0.0343 / 2;
+}
+
+void pushSiValido(MedianFilter& f, long v) {
+  if (v >= 5 && v < 999) f.push(v);
+}
+
+void leerSensores() {
+  pushSiValido(filtR, medirCm(TRIG_R, ECHO_R));
+  pushSiValido(filtL, medirCm(TRIG_L, ECHO_L));
+  pushSiValido(filtB, medirCm(TRIG_B, ECHO_B));
+
+  lastR = filtR.get();
+  lastL = filtL.get();
+  lastB = filtB.get();
+}
+
+// =====================================================
+// HAZARD TASK
+// =====================================================
+void hazardTask(void *p) {
+  pinMode(LED_L, OUTPUT);
+  pinMode(LED_R, OUTPUT);
+
+  bool on = false;
+  int subStep = 0;
+
+  while (true) {
+    int delayMs = 300;
+
+    switch (hazardMode) {
+      case 0:
+        digitalWrite(LED_L, LOW);
+        digitalWrite(LED_R, LOW);
+        delayMs = 100;
+        break;
+
+      case 1:
+        on = !on;
+        digitalWrite(LED_L, on);
+        digitalWrite(LED_R, on);
+        delayMs = 350;
+        break;
+
+      case 2:
+        on = !on;
+        digitalWrite(LED_L, on);
+        digitalWrite(LED_R, on);
+        delayMs = 120;
+        break;
+
+      case 3:
+        digitalWrite(LED_L, HIGH);
+        digitalWrite(LED_R, HIGH);
+        delayMs = 200;
+        break;
+
+      case 4:
+        subStep = (subStep + 1) % 6;
+        if (subStep == 0 || subStep == 2) {
+          digitalWrite(LED_L, HIGH);
+          digitalWrite(LED_R, HIGH);
+        } else {
+          digitalWrite(LED_L, LOW);
+          digitalWrite(LED_R, LOW);
+        }
+        delayMs = 120;
+        break;
+    }
+
+    vTaskDelay(delayMs / portTICK_PERIOD_MS);
+  }
+}
+
+// =====================================================
+// AUTO PARK
+// =====================================================
+void abortParking(const char* m) {
+  publishLine(String("ABORT,") + m);
+  fullStop();
+  hazardMode = 4;
+  mode = MANUAL;
+  parkState = ABORTADO;
+}
+
+void finishParking() {
+  publishLine("INFO,ESTACIONADO");
+  fullStop();
+  hazardMode = 3;
+  mode = MANUAL;
+  parkState = ESTACIONADO;
+}
+
+int tAvanceInicialMsEff() {
+  if (P.tAvanceInicialMs > 0) return P.tAvanceInicialMs;
+  if (P.cmPorSegPark <= 0) return 2500;
+  return P.distInicialCm * 1000 / P.cmPorSegPark;
+}
+
+int tAvanzarMedioMsEff() {
+  if (P.tAvanzarHuecoMs > 0) return P.tAvanzarHuecoMs;
+  if (P.cmPorSegPark <= 0) return 700;
+  int cm = P.carLargoCm / 2 + 4;
+  return cm * 1000 / P.cmPorSegPark;
+}
+
+void startParking(int side) {
+  parkSide = side;
+  publishLine(String("INFO,AUTO_PARK_START,") + (side > 0 ? "RIGHT" : "LEFT"));
+
+  mode = AUTO_PARK;
+  hazardMode = 2;
+  parkState = AVANCE_INICIAL;
+  stateStart = millis();
+  autoStart  = millis();
+
+  countCarro = 0;
+  countHueco = 0;
+  huecoT0 = 0;
+  huecoLastT = 0;
+  huecoLargoCm = 0;
+
+  steerCenter();
+  kickArmPending = true;
+}
+
+void parkingLoop() {
+  if (mode != AUTO_PARK) return;
+
+  if (millis() - autoStart > (unsigned long)P.maxAutoMs) {
+    abortParking("watchdog");
+    return;
+  }
+
+  long dLatPark  = (parkSide > 0) ? lastR : lastL;
+  long dLatCalle = (parkSide > 0) ? lastL : lastR;
+  long dBack     = lastB;
+  int huecoMinCm = P.carAnchoCm + P.margenHuecoCm;
+
+  switch (parkState) {
+    case AVANCE_INICIAL: {
+      if (steerBusy()) {
+        driveStop();
+        break;
+      }
+
+      if (kickArmPending) {
+        armKickStart();
+        kickArmPending = false;
+      }
+
+      driveForwardKick(P.parkDriveSpeed);
+
+      if (millis() - stateStart > (unsigned long)tAvanceInicialMsEff()) {
+        publishLine("INFO,FIN_AVANCE_INICIAL");
+        parkState = MEDIR_HUECO;
+        stateStart = millis();
+        huecoT0 = 0;
+        huecoLastT = 0;
+        huecoLargoCm = 0;
+        countHueco = 0;
+        countCarro = 0;
+        hazardMode = 0;
+      }
+      break;
+    }
+
+    case MEDIR_HUECO: {
+      driveForwardKick(P.parkDriveSpeed);
+
+      bool enHueco = (dLatPark > P.distHuecoCm);
+      bool enCarro = (dLatPark < P.distCarroCm);
+
+      if (enHueco) {
+        unsigned long now = millis();
+
+        if (huecoT0 == 0) {
+          huecoT0 = now;
+          huecoLastT = now;
+          huecoLargoCm = 0;
+          countHueco = 1;
+        } else {
+          unsigned long dt = now - huecoLastT;
+          huecoLastT = now;
+          huecoLargoCm += (int)(dt * (unsigned long)P.cmPorSegPark / 1000UL);
+          countHueco++;
+        }
+
+        if (huecoLargoCm >= huecoMinCm && countHueco >= 3) {
+          publishLine(String("INFO,HUECO_OK,") + huecoLargoCm);
+          hazardMode = 1;
+          parkState = AVANZAR_PASA_HUECO;
+          stateStart = millis();
+          armKickStart();
+          break;
+        }
+      } else if (enCarro) {
+        if (huecoT0 != 0) {
+          publishLine(String("INFO,HUECO_DESCARTADO,") + huecoLargoCm);
+        }
+        huecoT0 = 0;
+        huecoLastT = 0;
+        huecoLargoCm = 0;
+        countHueco = 0;
+      }
+
+      if (millis() - stateStart > 20000) {
+        abortParking("timeout_medir_hueco");
+      }
+      break;
+    }
+
+    case AVANZAR_PASA_HUECO: {
+      driveForwardKick(P.parkDriveSpeed);
+      if (millis() - stateStart > (unsigned long)tAvanzarMedioMsEff()) {
+        driveStop();
+        if (parkSide > 0) steerFullRight();
+        else steerFullLeft();
+
+        parkState = STOP_Y_GIRAR;
+        stateStart = millis();
+      }
+      break;
+    }
+
+    case STOP_Y_GIRAR: {
+      driveStop();
+      if (!steerBusy()) {
+        publishLine("INFO,DIRECCION_GIRADA");
+        parkState = REVERSA_GIRO;
+        stateStart = millis();
+        armKickStart();
+      }
+      break;
+    }
+
+    case REVERSA_GIRO: {
+      if (dLatPark < 4)  { abortParking("lateral_park_muy_cerca"); break; }
+      if (dLatCalle < 6) { abortParking("lateral_calle_muy_cerca"); break; }
+
+      driveReverseKick(P.parkDriveSpeed);
+
+      if (dBack < P.distFrenaSuaveCm && dBack >= 5) {
+        driveStop();
+        publishLine("INFO,REVERSA_GIRO_FIN_SUAVE");
+        parkState = STOP_Y_ENDEREZAR;
+        stateStart = millis();
+        steerCenter();
+        break;
+      }
+
+      if (millis() - stateStart > (unsigned long)P.tReversaGiroMs) {
+        driveStop();
+        publishLine("INFO,REVERSA_GIRO_TIMEOUT");
+        parkState = STOP_Y_ENDEREZAR;
+        stateStart = millis();
+        steerCenter();
+      }
+      break;
+    }
+
+    case STOP_Y_ENDEREZAR: {
+      driveStop();
+      if (!steerBusy()) {
+        publishLine("INFO,DIRECCION_CENTRADA");
+        parkState = REVERSA_RECTA;
+        stateStart = millis();
+        armKickStart();
+      }
+      break;
+    }
+
+    case REVERSA_RECTA: {
+      if (dLatPark < 4)  { abortParking("lateral_park_muy_cerca"); break; }
+      if (dLatCalle < 6) { abortParking("lateral_calle_muy_cerca"); break; }
+
+      driveReverseKick((int)(P.parkDriveSpeed * 0.7));
+
+      int dParo = P.distParaYaCm + P.margenBanquetaCm;
+      if (dBack >= 5 && dBack < dParo) {
+        finishParking();
+        break;
+      }
+
+      if (millis() - stateStart > 4000) {
+        publishLine("INFO,REVERSA_RECTA_TIMEOUT");
+        finishParking();
+      }
+      break;
+    }
+
+    default:
+      break;
+  }
+}
+
+// =====================================================
+// PARAMETROS POR COMANDO
+// =====================================================
+void applyParam(const String& k, int v) {
+  if      (k=="driveSpeed")        P.driveSpeed        = constrain(v,0,255);
+  else if (k=="parkDriveSpeed")    P.parkDriveSpeed    = constrain(v,0,255);
+  else if (k=="steerSpeed")        P.steerSpeed        = constrain(v,0,255);
+  else if (k=="tSteerFullMs")      P.tSteerFullMs      = constrain(v,100,1500);
+  else if (k=="steerTrimMs")       P.steerTrimMs       = constrain(v,-150,150);
+  else if (k=="distCarroCm") {
+    P.distCarroCm = constrain(v,5,100);
+    if (P.distHuecoCm < P.distCarroCm + 10) P.distHuecoCm = P.distCarroCm + 10;
+  }
+  else if (k=="distHuecoCm") {
+    P.distHuecoCm = constrain(v,10,200);
+    if (P.distHuecoCm < P.distCarroCm + 10) P.distHuecoCm = P.distCarroCm + 10;
+  }
+  else if (k=="distFrenaSuaveCm")  P.distFrenaSuaveCm  = constrain(v,3,50);
+  else if (k=="distParaYaCm")      P.distParaYaCm      = constrain(v,2,30);
+  else if (k=="tAvanceInicialMs")  P.tAvanceInicialMs  = constrain(v,0,10000);
+  else if (k=="tAvanzarHuecoMs")   P.tAvanzarHuecoMs   = constrain(v,0,5000);
+  else if (k=="minHuecoStableMs")  P.minHuecoStableMs  = constrain(v,0,2000);
+  else if (k=="maxAutoMs")         P.maxAutoMs         = constrain(v,5000,300000);
+  else if (k=="carLargoCm")        P.carLargoCm        = constrain(v,5,100);
+  else if (k=="carAnchoCm")        P.carAnchoCm        = constrain(v,5,50);
+  else if (k=="carAltoCm")         P.carAltoCm         = constrain(v,5,50);
+  else if (k=="margenHuecoCm")     P.margenHuecoCm     = constrain(v,0,30);
+  else if (k=="margenBanquetaCm")  P.margenBanquetaCm  = constrain(v,0,20);
+  else if (k=="cmPorSegPark")      P.cmPorSegPark      = constrain(v,5,200);
+  else if (k=="distInicialCm")     P.distInicialCm     = constrain(v,20,300);
+  else if (k=="kickStartPWM")      P.kickStartPWM      = constrain(v,100,255);
+  else if (k=="kickStartMs")       P.kickStartMs       = constrain(v,0,500);
+  else if (k=="tReversaGiroMs")    P.tReversaGiroMs    = constrain(v,200,5000);
+}
+
+// =====================================================
+// PARSER DE COMANDOS
+// =====================================================
+// Comandos soportados por TCP y UART:
+// W S X A D C
+// PR PL
+// T H CAL ESTOP
+// SET:clave=valor
+// PING
+void handleCommand(String cmd, const String& sourceName) {
+  cmd.trim();
+  if (cmd.length() == 0) return;
+
+  lastAnyCmdMs = millis();
+  publishLine("RX," + sourceName + "," + cmd);
+
+  if (cmd.startsWith("SET:")) {
+    int eq = cmd.indexOf('=');
+    if (eq > 4) {
+      String k = cmd.substring(4, eq);
+      int v = cmd.substring(eq + 1).toInt();
+      applyParam(k, v);
+      publishLine("INFO,SET_OK," + k + "," + String(v));
+    } else {
+      publishLine("ERR,BAD_SET_FORMAT");
+    }
+    return;
+  }
+
+  if (cmd.equalsIgnoreCase("PING")) {
+    publishLine("PONG");
+    return;
+  }
+
+  if (mode == AUTO_PARK && cmd != "PR" && cmd != "PL") {
+    abortParking("manual_override");
+  }
+
+  if      (cmd == "PR")    { if (mode == MANUAL) startParking(+1); }
+  else if (cmd == "PL")    { if (mode == MANUAL) startParking(-1); }
+  else if (cmd == "T")     { mode = (mode == SENSOR_TEST) ? MANUAL : SENSOR_TEST; publishLine("INFO,MODE," + modeToString()); }
+  else if (cmd == "H")     { hazardMode = (hazardMode == 0) ? 1 : 0; publishLine("INFO,HAZARD," + String(hazardMode)); }
+  else if (cmd == "CAL")   { steerCalibrateHome(); steerCenter(); publishLine("INFO,CAL_OK"); }
+  else if (cmd == "ESTOP") { abortParking("estop"); fullStop(); }
+  else if (cmd == "W")     { mode = MANUAL; driveForward(); }
+  else if (cmd == "S")     { mode = MANUAL; driveReverse(); }
+  else if (cmd == "X")     { mode = MANUAL; driveStop(); }
+  else if (cmd == "A")     { mode = MANUAL; steerRawLeft(); }
+  else if (cmd == "D")     { mode = MANUAL; steerRawRight(); }
+  else if (cmd == "C")     { mode = MANUAL; steerRawStop(); }
+  else {
+    publishLine("ERR,UNKNOWN_COMMAND");
+  }
+}
+
+// =====================================================
+// TCP
+// =====================================================
+void acceptNewClients() {
+  if (tcpServer.hasClient()) {
+    WiFiClient newClient = tcpServer.available();
+
+    int freeSlot = -1;
+    for (int i = 0; i < 4; i++) {
+      if (!tcpClients[i] || !tcpClients[i].connected()) {
+        freeSlot = i;
+        break;
+      }
+    }
+
+    if (freeSlot >= 0) {
+      if (tcpClients[freeSlot]) tcpClients[freeSlot].stop();
+
+      tcpClients[freeSlot] = newClient;
+      tcpBuffers[freeSlot] = "";
+
+      tcpClients[freeSlot].println("INFO,TCP_CONNECTED");
+      publishLine("INFO,TCP_CLIENT_CONNECTED," + String(freeSlot));
+    } else {
+      newClient.println("ERR,NO_FREE_SLOT");
+      newClient.stop();
+    }
+  }
+}
+
+void cleanupClients() {
+  for (int i = 0; i < 4; i++) {
+    if (tcpClients[i] && !tcpClients[i].connected()) {
+      tcpClients[i].stop();
+      tcpBuffers[i] = "";
+    }
+  }
+}
+
+void readTcpCommands() {
+  for (int i = 0; i < 4; i++) {
+    if (tcpClients[i] && tcpClients[i].connected()) {
+      while (tcpClients[i].available()) {
+        char c = (char)tcpClients[i].read();
+
+        if (c == '\n') {
+          handleCommand(tcpBuffers[i], "TCP");
+          tcpBuffers[i] = "";
+        } else if (c != '\r') {
+          tcpBuffers[i] += c;
+          if (tcpBuffers[i].length() > 200) {
+            tcpBuffers[i] = "";
+            publishLine("ERR,TCP_BUFFER_OVERFLOW");
+          }
+        }
+      }
+    }
+  }
+}
+
+// =====================================================
+// UART
+// =====================================================
+void readUARTCommands() {
+  while (PiSerial.available()) {
+    char c = (char)PiSerial.read();
+
+    if (c == '\n') {
+      handleCommand(uartBuffer, "UART");
+      uartBuffer = "";
+    } else if (c != '\r') {
+      uartBuffer += c;
+      if (uartBuffer.length() > 200) {
+        uartBuffer = "";
+        publishLine("ERR,UART_BUFFER_OVERFLOW");
+      }
+    }
+  }
+}
+
+// =====================================================
+// TIMEOUT DE SEGURIDAD
+// =====================================================
+void handleGlobalTimeout() {
+  if (mode == AUTO_PARK) return;
+
+  unsigned long now = millis();
+  if (now - lastAnyCmdMs > GLOBAL_CMD_TIMEOUT_MS) {
+    driveStop();
+    steerRawStop();
+  }
+}
+
+// =====================================================
+// SETUP
+// =====================================================
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("BOOTING...");
+
+  PiSerial.begin(115200, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
+
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+
+  pinMode(TRIG_R, OUTPUT); pinMode(ECHO_R, INPUT);
+  pinMode(TRIG_L, OUTPUT); pinMode(ECHO_L, INPUT);
+  pinMode(TRIG_B, OUTPUT); pinMode(ECHO_B, INPUT);
+
+  ledcSetup(CH_STEER, PWM_FREQ, PWM_RES);
+  ledcSetup(CH_DRIVE, PWM_FREQ, PWM_RES);
+  ledcAttachPin(ENA, CH_STEER);
+  ledcAttachPin(ENB, CH_DRIVE);
+
+  fullStop();
+  delay(400);
+  steerCalibrateHome();
+  steerCenter();
+
+  WiFi.disconnect(true, true);
+  delay(500);
+  WiFi.mode(WIFI_OFF);
+  delay(500);
+  WiFi.mode(WIFI_AP);
+  delay(500);
+
+  bool apOk = WiFi.softAP(AP_SSID, AP_PASS);
+  delay(1000);
+
+  if (apOk) {
+    Serial.println("AP creado correctamente");
+    Serial.print("SSID: ");
+    Serial.println(AP_SSID);
+    Serial.print("IP del AP: ");
+    Serial.println(WiFi.softAPIP());
+  } else {
+    Serial.println("ERR,WIFI_AP_FAIL");
+  }
+
+  tcpServer.begin();
+  tcpServer.setNoDelay(true);
+
+  xTaskCreatePinnedToCore(hazardTask, "hazard", 2048, NULL, 1, NULL, 0);
+
+  lastAnyCmdMs = millis();
+
+  publishLine("INFO,SYSTEM_READY");
+  publishLine("INFO,TCP_PORT,8080");
+  publishLine("INFO,UART_READY,115200");
+  publishLine("INFO,MODE,MANUAL");
+}
+
+// =====================================================
+// LOOP
+// =====================================================
+void loop() {
+  steerUpdate();
+  leerSensores();
+
+  acceptNewClients();
+  cleanupClients();
+  readTcpCommands();
+  readUARTCommands();
+
+  parkingLoop();
+  handleGlobalTimeout();
+
+  if (millis() - lastTelemetryMs >= TELEMETRY_INTERVAL_MS) {
+    lastTelemetryMs = millis();
+    sendTelemetry();
+  }
+
+  static unsigned long tPrint = 0;
+  if (mode == SENSOR_TEST && millis() - tPrint > 500) {
+    tPrint = millis();
+    Serial.printf("R:%ld  L:%ld  B:%ld\n", lastR, lastL, lastB);
+    PiSerial.printf("R:%ld  L:%ld  B:%ld\n", lastR, lastL, lastB);
+  }
+
+  delay(10);
+}
