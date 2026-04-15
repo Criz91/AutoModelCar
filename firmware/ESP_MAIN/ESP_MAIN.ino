@@ -41,16 +41,14 @@ const int TRIG_R = 4,  ECHO_R = 5;   // derecho
 const int TRIG_L = 6,  ECHO_L = 7;   // izquierdo
 const int TRIG_B = 15, ECHO_B = 9;   // trasero
 const int TRIG_F = 1,  ECHO_F = 2;   // frontal (NUEVO)
-// NOTA: GPIO1 y GPIO2 en ESP32-S3 son GPIO normales (no son UART0 como en
-// ESP32 clasico). Si la placa concreta los expone como strapping pins,
-// reasignar antes de soldar.
+
 
 // Seguidores de linea TCRT5000 (digitales, salida del comparador)
 const int LINE_L = 38;   // izquierda
 const int LINE_R = 39;   // derecha
 const int LINE_C = 40;   // centro
 // Polaridad: el modulo MDU-SEN-MH-TCRT5000 entrega LOW cuando ve superficie
-// reflectiva (linea blanca sobre piso negro). Si la pista de tu equipo
+// reflectiva (linea blanca sobre piso negro). Si la pista
 // invierte la polaridad, cambiar LINE_ACTIVE_LOW a 0.
 #define LINE_ACTIVE_LOW 1
 
