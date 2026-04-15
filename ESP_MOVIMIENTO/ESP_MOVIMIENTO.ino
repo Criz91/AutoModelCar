@@ -7,13 +7,13 @@ const char* ap_ssid = "ESP32_PRUEBA";
 const char* ap_pass = "123456785";   // mínimo 8 caracteres
 
 // ====== Pines Puente H ======
-const int IN1 = 12;   // Dirección
-const int IN2 = 13;
-const int ENA = 18;
+const int IN1 = 11;   // Dirección
+const int IN2 = 12;
+const int ENA = 8;
 
 const int IN3 = 14;   // Tracción
-const int IN4 = 11;
-const int ENB = 19;
+const int IN4 = 13;
+const int ENB = 18;
 
 // ====== PWM ======
 const int PWM_FREQ = 20000;
