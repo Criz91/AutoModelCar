@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(arduino-cli version:*)",
+      "Bash(python -m py_compile control_gui.py)",
+      "Bash(python -c \"import sys; data=open\\('requirements.txt','rb'\\).read\\(\\); print\\('First bytes:', data[:8]\\); print\\('Repr:', repr\\(data[:50]\\)\\)\")",
+      "Bash(python -c \"data=open\\('requirements.txt','rb'\\).read\\(\\); print\\('First bytes:', data[:8]\\); print\\(data.decode\\('utf-8'\\)\\)\")",
+      "Bash(python -c \"open\\('requirements.txt','wb'\\).write\\(b'pynput==1.8.1\\\\nsix==1.17.0\\\\n'\\)\")",
+      "Bash(python -c \"data=open\\('requirements.txt','rb'\\).read\\(\\); print\\('First bytes:', data[:16]\\); print\\('Decoded:'\\); print\\(data.decode\\('utf-8'\\)\\)\")",
+      "Bash(python -c ':*)",
+      "Bash(ls rpi:*)",
+      "Bash(mkdir rpi:*)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('rpi/master_autonomo_hailo.py',encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")"
+    ]
+  }
+}
