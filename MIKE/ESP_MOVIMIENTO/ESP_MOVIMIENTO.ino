@@ -84,7 +84,6 @@ volatile Mode mode = MANUAL;
 enum ParkState {
   IDLE,
   AVANCE_INICIAL,
-  BUSCAR_CARRO,
   MEDIR_HUECO,
   AVANZAR_PASA_HUECO,
   STOP_Y_GIRAR,
@@ -137,9 +136,11 @@ volatile long lastR = 999, lastL = 999, lastB = 999;
 int countCarro = 0;
 int countHueco = 0;
 unsigned long huecoT0 = 0;        // inicio de hueco abierto
+unsigned long huecoLastT = 0;     // ultimo frame valido del hueco actual
 int huecoLargoCm = 0;             // longitud integrada del hueco actual
 unsigned long kickStartT0 = 0;    // inicio del kick-start del estado actual
 bool kickStartActive = false;     // true mientras se aplica PWM alto
+bool kickArmPending = false;      // pendiente de armar kick-start cuando termine la direccion
 
 AsyncWebServer server(80);
 AsyncWebSocket ws("/ws");
@@ -304,16 +305,6 @@ void hazardTask(void *p) {
   }
 }
 
-// 5 parpadeos rapidos bloqueantes antes de arrancar
-void preflashLeds() {
-  for (int i = 0; i < 5; i++) {
-    digitalWrite(LED_L, HIGH); digitalWrite(LED_R, HIGH);
-    delay(150);
-    digitalWrite(LED_L, LOW); digitalWrite(LED_R, LOW);
-    delay(150);
-  }
-}
-
 // Arranca la maniobra automatica. side = +1 estaciona a la derecha,
 // side = -1 a la izquierda. Hace un preflash bloqueante de 5 destellos
 // como aviso visual antes de empezar a moverse y arma el kick-start
@@ -323,22 +314,24 @@ void startParking(int side) {
   Serial.print(">>> AUTO PARK START side=");
   Serial.println(side > 0 ? "DERECHA" : "IZQUIERDA");
 
-  // Pausa hazards y hace preflash
-  hazardMode = 0;
-  delay(50);
-  preflashLeds();
-
+  // No bloqueamos el handler del WebSocket. La hazardTask hara el
+  // patron rapido durante el avance inicial como aviso visual y se
+  // apagara cuando empiece a buscar el hueco.
   mode = AUTO_PARK;
-  hazardMode = 0;  // apagados durante avance inicial
+  hazardMode = 2;  // intermitente rapido durante avance inicial
   parkState = AVANCE_INICIAL;
   stateStart = millis();
   autoStart  = millis();
   countCarro = 0;
   countHueco = 0;
   huecoT0 = 0;
+  huecoLastT = 0;
   huecoLargoCm = 0;
   steerCenter();
-  armKickStart();
+  // No armamos el kick-start aqui: la direccion esta centrandose y
+  // los 150 ms se gastarian en vano. AVANCE_INICIAL lo arma cuando
+  // detecta que la direccion ya termino.
+  kickArmPending = true;
 }
 
 void abortParking(const char* m) {
@@ -390,6 +383,13 @@ void parkingLoop() {
     case AVANCE_INICIAL: {
       // Avanza recto el "1 metro inicial" sin buscar nada
       if (steerBusy()) { driveStop(); break; }
+      // La direccion ya termino. Si veniamos de startParking con el
+      // kick-start pendiente, lo armamos justo ahora para que los 150 ms
+      // de PWM alto se apliquen en el primer movimiento real.
+      if (kickArmPending) {
+        armKickStart();
+        kickArmPending = false;
+      }
       driveForwardKick(P.parkDriveSpeed);
       if (millis() - stateStart > (unsigned long)tAvanceInicialMsEff()) {
         Serial.println("Fin avance inicial -> medir hueco");
@@ -400,60 +400,62 @@ void parkingLoop() {
         parkState = MEDIR_HUECO;
         stateStart = millis();
         huecoT0 = 0;
+        huecoLastT = 0;
         huecoLargoCm = 0;
         countHueco = 0;
         countCarro = 0;
+        // Apagamos hazards: durante la busqueda van apagadas y se
+        // prenden cuando confirmemos el hueco.
+        hazardMode = 0;
       }
-      break;
-    }
-
-    case BUSCAR_CARRO: {
-      // Estado conservado por compatibilidad. La logica nueva salta este
-      // estado y pasa directo de AVANCE_INICIAL a MEDIR_HUECO para soportar
-      // el caso del primer cajon vacio.
-      parkState = MEDIR_HUECO;
-      stateStart = millis();
-      huecoT0 = 0;
-      huecoLargoCm = 0;
-      countHueco = 0;
       break;
     }
 
     case MEDIR_HUECO: {
       driveForwardKick(P.parkDriveSpeed);
 
-      // Estamos en hueco si dLatPark > distHuecoCm (banda muerta entre ambos thresholds)
+      // Estamos en hueco si dLatPark > distHuecoCm. Si esta entre los
+      // dos umbrales (banda muerta) no contamos ese frame ni a favor
+      // ni en contra: mantiene el estado actual sin modificar la integral.
       bool enHueco = (dLatPark > P.distHuecoCm);
       bool enCarro = (dLatPark < P.distCarroCm);
 
       if (enHueco) {
+        unsigned long now = millis();
         if (huecoT0 == 0) {
-          huecoT0 = millis();
+          huecoT0 = now;
+          huecoLastT = now;
+          huecoLargoCm = 0;
           countHueco = 1;
         } else {
+          // Integral incremental: solo suma el dt entre dos frames
+          // que ambos vieron hueco. Si pasamos por banda muerta, esos
+          // ms no se cuentan (mas conservador, no sobrestima el hueco).
+          unsigned long dt = now - huecoLastT;
+          huecoLastT = now;
+          huecoLargoCm += (int)(dt * (unsigned long)P.cmPorSegPark / 1000UL);
           countHueco++;
         }
-        // Integrar longitud del hueco (cm) usando velocidad calibrada
-        unsigned long dt = millis() - huecoT0;
-        huecoLargoCm = (int)(dt * (unsigned long)P.cmPorSegPark / 1000UL);
         if (huecoLargoCm >= huecoMinCm && countHueco >= 3) {
           Serial.print("Hueco OK, largo="); Serial.println(huecoLargoCm);
-          hazardMode = 1; // intermitentes ON
+          hazardMode = 1; // intermitentes ON al confirmar el hueco
           parkState = AVANZAR_PASA_HUECO;
           stateStart = millis();
           armKickStart();
           break;
         }
       } else if (enCarro) {
-        // Hueco se cerro antes de alcanzar el largo minimo -> descartar y seguir buscando
+        // Hueco se cerro antes de alcanzar el largo minimo -> descartar
         if (huecoT0 != 0) {
           Serial.print("Hueco descartado, largo="); Serial.println(huecoLargoCm);
         }
         huecoT0 = 0;
+        huecoLastT = 0;
         huecoLargoCm = 0;
         countHueco = 0;
       }
-      // Banda muerta: ni cuenta como carro ni cierra el hueco actual; mantiene estado.
+      // Banda muerta: no toca huecoT0/huecoLargoCm/countHueco. La
+      // integral se reanuda en el siguiente frame que vea hueco real.
 
       if (millis() - stateStart > 20000) abortParking("timeout medir hueco");
       break;
@@ -561,7 +563,6 @@ const char* parkStateName() {
   switch (parkState) {
     case IDLE:               return "IDLE";
     case AVANCE_INICIAL:     return "AVANCE_INI";
-    case BUSCAR_CARRO:       return "BUSCAR_CARRO";
     case MEDIR_HUECO:        return "MEDIR_HUECO";
     case AVANZAR_PASA_HUECO: return "AVANZAR";
     case STOP_Y_GIRAR:       return "GIRAR";
@@ -599,8 +600,16 @@ void applyParam(const String& k, int v) {
   else if (k=="steerSpeed")        P.steerSpeed        = constrain(v,0,255);
   else if (k=="tSteerFullMs")      P.tSteerFullMs      = constrain(v,100,1500);
   else if (k=="steerTrimMs")       P.steerTrimMs       = constrain(v,-150,150);
-  else if (k=="distCarroCm")       P.distCarroCm       = constrain(v,5,100);
-  else if (k=="distHuecoCm")       P.distHuecoCm       = constrain(v,10,200);
+  else if (k=="distCarroCm") {
+    P.distCarroCm = constrain(v,5,100);
+    // distHuecoCm siempre debe estar al menos 10 cm por encima de
+    // distCarroCm para tener una banda muerta util y evitar oscilaciones.
+    if (P.distHuecoCm < P.distCarroCm + 10) P.distHuecoCm = P.distCarroCm + 10;
+  }
+  else if (k=="distHuecoCm") {
+    P.distHuecoCm = constrain(v,10,200);
+    if (P.distHuecoCm < P.distCarroCm + 10) P.distHuecoCm = P.distCarroCm + 10;
+  }
   else if (k=="distFrenaSuaveCm")  P.distFrenaSuaveCm  = constrain(v,3,50);
   else if (k=="distParaYaCm")      P.distParaYaCm      = constrain(v,2,30);
   else if (k=="tAvanceInicialMs")  P.tAvanceInicialMs  = constrain(v,0,10000);
