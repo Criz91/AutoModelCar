@@ -57,6 +57,11 @@ const int LINE_C = 40;   // centro
 // LEDs (intermitentes / hazards)
 const int LED_L = 10, LED_R = 21;
 
+// LED de freno (stop light) - AVISO: ESP32-S3 soporta GPIO 0-48.
+// Si tu placa no expone GPIO 51 (o usa un expansor de I/O), cambia este valor
+// al GPIO fisico disponible en tu PCB (p.ej. 47 o 48).
+const int LED_STOP = 51;
+
 // PWM
 const int PWM_FREQ = 20000;
 const int PWM_RES  = 8;
@@ -172,7 +177,9 @@ bool kickArmPending = false;
 
 // VARIABLES LINE FOLLOW
 int  lfLastSteerTarget = -1;  // -1 = sin objetivo previo, evita refire
-unsigned long lfStart = 0;
+unsigned long lfStart      = 0;
+unsigned long lfCruceStart = 0;  // 0=normal, >0=en espera de cruce peatonal
+unsigned long lfSlowUntil  = 0;  // frenar en curva hasta este timestamp
 
 // VARIABLES TEST PARK (prueba ciega sin ultrasonicos)
 // Paso 0: calibrar volante (blocking) + 3 parpadeos de LED como countdown
@@ -288,9 +295,13 @@ void setMotor(int in1, int in2, int ch, int speed) {
   ledcWrite(ch, s);
 }
 
-void driveForward(int s = -1) { setMotor(IN3, IN4, CH_DRIVE, +(s < 0 ? P.driveSpeed : s)); }
-void driveReverse(int s = -1) { setMotor(IN3, IN4, CH_DRIVE, -(s < 0 ? P.driveSpeed : s)); }
-void driveStop()              { setMotor(IN3, IN4, CH_DRIVE, 0); }
+// LED de freno
+inline void stopLedOn()  { digitalWrite(LED_STOP, HIGH); }
+inline void stopLedOff() { digitalWrite(LED_STOP, LOW);  }
+
+void driveForward(int s = -1) { stopLedOff(); setMotor(IN3, IN4, CH_DRIVE, +(s < 0 ? P.driveSpeed : s)); }
+void driveReverse(int s = -1) { stopLedOff(); setMotor(IN3, IN4, CH_DRIVE, -(s < 0 ? P.driveSpeed : s)); }
+void driveStop()              { stopLedOn();  setMotor(IN3, IN4, CH_DRIVE, 0); }
 
 void steerRawLeft()  { setMotor(IN1, IN2, CH_STEER, -P.steerSpeed); steerMoveDir = 0; }
 void steerRawRight() { setMotor(IN1, IN2, CH_STEER, +P.steerSpeed); steerMoveDir = 0; }
@@ -358,6 +369,7 @@ void driveForwardKick(int cruise) {
     kickStartActive = false;
     s = cruise;
   }
+  stopLedOff();
   setMotor(IN3, IN4, CH_DRIVE, +s);
 }
 
@@ -369,6 +381,7 @@ void driveReverseKick(int cruise) {
     kickStartActive = false;
     s = cruise;
   }
+  stopLedOff();
   setMotor(IN3, IN4, CH_DRIVE, -s);
 }
 
@@ -720,6 +733,8 @@ void startLineFollow() {
   hazardMode = 1;          // intermitente lento, se ve que esta en automatico
   lfStart = millis();
   lfLastSteerTarget = -1;
+  lfCruceStart = 0;
+  lfSlowUntil  = 0;
   armKickStart();
 }
 
@@ -734,16 +749,42 @@ void stopLineFollow(const char* reason) {
 void lineFollowLoop() {
   if (mode != LINE_FOLLOW) return;
 
-  // Tiempo limite de seguridad por si la Pi se cuelga sin mandar NOLF
-  if (millis() - lfStart > 15000UL) {
-    stopLineFollow("watchdog_15s");
+  // Watchdog: 30s maximo (incluye posibles esperas en cruces)
+  if (millis() - lfStart > 30000UL) {
+    stopLineFollow("watchdog_30s");
     return;
   }
 
-  // Avance constante con kick start al inicio
-  driveForwardKick(P.lineFollowSpeed);
+  // ---- CRUCE PEATONAL: detenerse 10 segundos ----
+  if (lfCruceStart > 0) {
+    driveStop();
+    if (millis() - lfCruceStart >= 10000UL) {
+      // Fin de espera - reanudar circuito
+      hazardMode = 1;         // volver a intermitente de LF
+      lfCruceStart = 0;
+      lfStart = millis();     // reiniciar watchdog
+      armKickStart();
+      lfLastSteerTarget = -1;
+      publishLine("INFO,LF_CRUCE_FIN,REANUDANDO");
+    }
+    return;
+  }
 
-  int center  = P.tSteerFullMs / 2 + P.steerTrimMs;
+  // ---- VELOCIDAD: reducida en curva, normal en recta ----
+  int curSpeed = P.lineFollowSpeed;
+  if (millis() < lfSlowUntil) {
+    curSpeed = P.lineFollowSpeed * 60 / 100;  // 60% en curva
+    stopLedOn();
+  } else {
+    stopLedOff();
+    driveForwardKick(curSpeed);
+  }
+  if (millis() < lfSlowUntil) {
+    // En frenado de curva no usar kick, aplicar directo
+    setMotor(IN3, IN4, CH_DRIVE, +curSpeed);
+  }
+
+  int center    = P.tSteerFullMs / 2 + P.steerTrimMs;
   int leftFull  = 0;
   int rightFull = P.tSteerFullMs;
   int leftSoft  = (int)(P.tSteerFullMs * 0.35);
@@ -756,9 +797,27 @@ void lineFollowLoop() {
   else if ( lnC && !lnL &&  lnR) target = rightSoft;
   else if (!lnC &&  lnL && !lnR) target = leftFull;
   else if (!lnC && !lnL &&  lnR) target = rightFull;
-  // C=0 L=1 R=1 (cruce), C=0 L=0 R=0 (perdido), C=1 L=1 R=1 (parche): mantener
+  else if (!lnC &&  lnL &&  lnR) {
+    // CRUCE PEATONAL detectado (ambos laterales ven blanco)
+    publishLine("INFO,LF_CRUCE_DETECTADO");
+    hazardMode = 2;     // intermitentes rapidos
+    stopLedOn();
+    driveStop();
+    lfCruceStart = millis();
+    lfLastSteerTarget = -1;
+    return;
+  }
+  // C=0 L=0 R=0 (perdido), C=1 L=1 R=1 (parche): mantener
 
   if (target != lfLastSteerTarget && target >= 0 && !steerBusy()) {
+    // Detectar cambio de sentido (recta -> curva): frenar un poco
+    bool eraRecto   = (lfLastSteerTarget == center || lfLastSteerTarget < 0);
+    bool ahoraCurva = (target == leftFull || target == rightFull);
+    if (!eraRecto && ahoraCurva) {
+      // Curva pronunciada: bajar velocidad 350 ms
+      lfSlowUntil = millis() + 350;
+      publishLine("INFO,LF_CURVA");
+    }
     steerGoTo(target);
     lfLastSteerTarget = target;
   }
@@ -1014,6 +1073,8 @@ void handleCommand(String cmd, const String& sourceName) {
   else if (cmd == "NOLF")  { if (mode == LINE_FOLLOW) stopLineFollow("nolf_cmd"); }
   else if (cmd == "T")     { mode = (mode == SENSOR_TEST) ? MANUAL : SENSOR_TEST; publishLine("INFO,MODE," + modeToString()); }
   else if (cmd == "H")     { hazardMode = (hazardMode == 0) ? 1 : 0; publishLine("INFO,HAZARD," + String(hazardMode)); }
+  else if (cmd == "HAZON") { hazardMode = 1; publishLine("INFO,HAZARD_ON"); }
+  else if (cmd == "HAZOFF"){ hazardMode = 0; publishLine("INFO,HAZARD_OFF"); }
   else if (cmd == "CAL")   { steerCalibrateHome(); steerCenter(); publishLine("INFO,CAL_OK"); }
   else if (cmd == "ESTOP") { abortParking("estop"); fullStop(); }
   else if (cmd == "W")     { mode = MANUAL; driveForward(); }
@@ -1138,6 +1199,9 @@ void setup() {
   pinMode(LINE_L, INPUT);
   pinMode(LINE_R, INPUT);
   pinMode(LINE_C, INPUT);
+
+  pinMode(LED_STOP, OUTPUT);
+  digitalWrite(LED_STOP, LOW);
 
   ledcSetup(CH_STEER, PWM_FREQ, PWM_RES);
   ledcSetup(CH_DRIVE, PWM_FREQ, PWM_RES);

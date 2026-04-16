@@ -107,12 +107,46 @@ UMBRAL_ACTIVIDAD = 0.05
 UMBRAL_ERROR_GIRO = 0.30   # rango [-1,1]; 0.30 = 30% desviado
 
 # Suavizado: cuantos frames consecutivos con el mismo comando se necesitan
-# antes de cambiar a otro. Evita zigzag por ruido en la mascara.
-CONFIRMACIONES_CAMBIO = 2
+# antes de cambiar a otro. 1 = reaccion inmediata (mejor para curvas),
+# 2+ = mas estable pero mas lento. Bajar si el carro llega tarde a las curvas.
+CONFIRMACIONES_CAMBIO = 1
 
 BLACKOUT_FRAMES = 5       # frames consecutivos sin carril -> entra a LF
 RECOVER_FRAMES  = 4       # frames consecutivos con carril -> sale de LF
 HISTERESIS      = 1.5     # multiplicador del umbral para recuperarse
+
+# ---- Deteccion de señales (detect-supremo.hef) ----
+MODELO_DETECT = "detect-supremo.hef"
+
+# Indice de clase "stop sign" en el modelo. Ejecuta el script una vez y
+# busca la linea "[DETECT-INFO] clase=N ..." para identificar el indice.
+# Si el modelo usa nombres, pon el nombre exacto en DETECT_NOMBRE_STOP.
+DETECT_CLASE_STOP   = None   # None = imprimir todo, luego poner el indice correcto
+DETECT_NOMBRE_STOP  = "stop" # nombre alternativo para buscar en la salida del modelo
+
+# Confianza minima para considerar una deteccion valida [0..1]
+DETECT_CONF_MIN = 0.50
+
+# Fraccion del area del frame a partir de la cual se activa cada fase:
+#   APROX: bbox ocupa el X% del frame -> hazards on + desacelerar (proximidad)
+#   STOP:  bbox ocupa el Y% del frame -> frenar 10 s (esta muy cerca)
+DETECT_AREA_APROX = 0.04   # 4% del frame = se esta acercando
+DETECT_AREA_STOP  = 0.10   # 10% del frame = ya esta cerca, frenar
+
+# Velocidad reducida durante la fase de aproximacion al stop
+VELOCIDAD_APROX = 150
+
+# Segundos que el carro permanece parado en el stop / paso peatonal
+STOP_ESPERA_S = 10
+
+# Cooldown tras reanudar: no volver a detectar el mismo stop por N segundos
+STOP_COOLDOWN_S = 20
+
+# Cada cuantos frames de carril se corre la inferencia de deteccion.
+# Hailo-8 corre los dos modelos en VDevice separados (un hilo cada uno).
+# Este valor solo controla cada cuanto el hilo de carril copia el frame
+# para que el hilo de deteccion lo procese.
+DETECT_FEED_INTERVALO = 6
 
 
 class CarroCerebro:
@@ -126,6 +160,14 @@ class CarroCerebro:
         self.modo_LF = False
         self.telemetria_esp = ""
         self.error_fatal = None   # si un hilo truena, guarda el mensaje
+
+        # Deteccion de señales de transito
+        self.frame_detect = None       # ultimo frame RGB para que el hilo detect lo analice
+        self.frame_detect_lock = threading.Lock()
+        self.frame_detect_event = threading.Event()  # señal: hay frame nuevo
+        self.parada_activa = False     # True = stop detectado, carril no manda comandos
+        self.stop_state = "normal"     # "normal" | "aproximando" | "detenido" | "cooldown"
+        self.stop_state_since = 0.0    # timestamp de cambio de estado
 
 
 cerebro = CarroCerebro()
@@ -189,6 +231,222 @@ def loop_inteligencia(uart):
         # Seguridad: parar motores si la IA truena
         enviar_comando("X", uart)
         enviar_comando("NOLF", uart)
+
+
+# ---------------------------------------------------------------------------
+# HILO DE DETECCION DE SEÑALES (detect-supremo.hef)
+# Corre en paralelo al hilo de carril, usando su propio VDevice de Hailo.
+# Recibe frames del hilo de carril via cerebro.frame_detect y actualiza
+# cerebro.stop_state para pausar el avance cuando detecta un stop.
+# ---------------------------------------------------------------------------
+
+def _parse_detecciones(output_dict, img_h, img_w, primer_frame):
+    """
+    Intenta parsear la salida de detect-supremo.hef y devuelve una lista de
+    (clase_id_o_nombre, confianza, area_relativa) para cada deteccion valida.
+
+    Como el formato exacto del modelo no es conocido de antemano, en el
+    primer frame imprime la forma de todos los tensores de salida para que
+    el usuario pueda ajustar DETECT_CLASE_STOP.
+    """
+    detecciones = []
+
+    for key, tensor in output_dict.items():
+        arr = np.squeeze(tensor)   # quitar dimension de batch
+
+        if primer_frame:
+            print("[DETECT-INFO] key='{}' shape={} dtype={}".format(
+                key, arr.shape, arr.dtype))
+
+        # Caso 1: tensor plano de detecciones [N, 5+C] o [N, 6]
+        # donde cada fila es [x1, y1, x2, y2, conf, class_id] o
+        # [x_c, y_c, w, h, conf, class_id]
+        if arr.ndim == 2 and arr.shape[-1] >= 6:
+            for row in arr:
+                conf = float(row[4])
+                if conf < DETECT_CONF_MIN:
+                    continue
+                class_val = row[5] if arr.shape[-1] == 6 else int(np.argmax(row[5:]))
+                class_id  = int(class_val) if arr.shape[-1] == 6 else class_val
+                # Calcular area del bounding box relativa al frame
+                if arr.shape[-1] >= 6:
+                    # Intentar como (x1,y1,x2,y2)
+                    x1, y1, x2, y2 = float(row[0]), float(row[1]), float(row[2]), float(row[3])
+                    # Si coordenadas son normalizadas (0..1)
+                    if x2 <= 1.0 and y2 <= 1.0:
+                        area = abs((x2 - x1) * (y2 - y1))
+                    else:
+                        area = abs((x2 - x1) * (y2 - y1)) / (img_w * img_h)
+                else:
+                    area = 0.0
+                if primer_frame:
+                    print("[DETECT-INFO]   clase={} conf={:.2f} area={:.3f}".format(
+                        class_id, conf, area))
+                detecciones.append((class_id, conf, area))
+
+        # Caso 2: tensor [N, 85] estilo YOLOv5 (4 bbox + 1 obj + 80 clases)
+        elif arr.ndim == 2 and arr.shape[-1] == 85:
+            for row in arr:
+                obj_conf = float(row[4])
+                if obj_conf < DETECT_CONF_MIN * 0.5:
+                    continue
+                class_id = int(np.argmax(row[5:]))
+                conf = obj_conf * float(row[5 + class_id])
+                if conf < DETECT_CONF_MIN:
+                    continue
+                x_c, y_c, bw, bh = row[0], row[1], row[2], row[3]
+                area = float(bw * bh)
+                if x_c > 1.0:  # coordenadas absolutas
+                    area /= (img_w * img_h)
+                if primer_frame:
+                    print("[DETECT-INFO]   clase={} conf={:.2f} area={:.3f}".format(
+                        class_id, conf, area))
+                detecciones.append((class_id, conf, area))
+
+    return detecciones
+
+
+def _es_stop(clase_id):
+    """Devuelve True si la clase corresponde a un stop sign."""
+    if DETECT_CLASE_STOP is None:
+        # No configurado aun: imprimir pero no activar
+        return False
+    return int(clase_id) == int(DETECT_CLASE_STOP)
+
+
+def _loop_deteccion_inner(uart):
+    """Logica del hilo de deteccion de señales."""
+    try:
+        from hailo_platform import HEF, VDevice, InputVStreamParams, OutputVStreamParams, InferVStreams
+    except ImportError:
+        print("[DETECT] hailo_platform no disponible. Hilo de deteccion desactivado.")
+        return
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    detect_path = os.path.join(script_dir, MODELO_DETECT)
+    if not os.path.exists(detect_path):
+        print("[DETECT] No se encontro '{}'. Hilo de deteccion desactivado.".format(detect_path))
+        print("[DETECT] Coloca detect-supremo.hef en:", script_dir)
+        return
+
+    print("[DETECT] Cargando modelo:", detect_path)
+    try:
+        target  = VDevice()
+        hef     = HEF(detect_path)
+        ng      = target.configure(hef)[0]
+        in_name = hef.get_input_vstream_infos()[0].name
+        print("[DETECT] Modelo listo. Input:", in_name)
+    except Exception as e:
+        print("[DETECT] Error al cargar modelo:", e)
+        return
+
+    primer_frame = True
+    stop_cooldown_end = 0.0   # timestamp hasta cuando NO detectar (cooldown)
+
+    with ng.activate():
+        params_in  = InputVStreamParams.make(ng)
+        params_out = OutputVStreamParams.make(ng)
+        with InferVStreams(ng, params_in, params_out) as pipe:
+            while not cerebro.stop_event.is_set():
+                # Esperar frame nuevo del hilo de carril (max 0.5s)
+                got_frame = cerebro.frame_detect_event.wait(timeout=0.5)
+                cerebro.frame_detect_event.clear()
+
+                if not got_frame:
+                    continue
+
+                with cerebro.frame_detect_lock:
+                    frame_rgb = cerebro.frame_detect
+                if frame_rgb is None:
+                    continue
+
+                # Pre-procesar para el modelo de deteccion
+                img_h, img_w = frame_rgb.shape[:2]
+                try:
+                    det_in_info = hef.get_input_vstream_infos()[0]
+                    det_h = det_in_info.shape[1] if len(det_in_info.shape) >= 2 else 640
+                    det_w = det_in_info.shape[2] if len(det_in_info.shape) >= 3 else 640
+                except Exception:
+                    det_h, det_w = 640, 640
+
+                img_resized = cv2.resize(frame_rgb, (det_w, det_h))
+                input_data  = {in_name: np.expand_dims(img_resized, axis=0).astype(np.uint8)}
+
+                try:
+                    output = pipe.infer(input_data)
+                except Exception as e:
+                    print("[DETECT] Error en inferencia:", e)
+                    continue
+
+                dets = _parse_detecciones(output, img_h, img_w, primer_frame)
+                primer_frame = False
+
+                ahora = time.time()
+
+                # ---- Cooldown: ignorar detecciones por un tiempo tras reanudar ----
+                if ahora < stop_cooldown_end:
+                    continue
+
+                # ---- Buscar stop sign con mayor area ----
+                mejor_area = 0.0
+                for (clase_id, conf, area) in dets:
+                    if _es_stop(clase_id) and area > mejor_area:
+                        mejor_area = area
+
+                estado_actual = cerebro.stop_state
+
+                # ---- Maquina de estados 2 fases ----
+                if estado_actual == "normal":
+                    if mejor_area >= DETECT_AREA_APROX:
+                        # Fase 1: aproximandose al stop
+                        cerebro.stop_state = "aproximando"
+                        cerebro.stop_state_since = ahora
+                        enviar_comando("HAZON", uart)
+                        enviar_comando("SET:driveSpeed={}".format(VELOCIDAD_APROX), uart)
+                        print("[STOP] Aproximando al stop (area={:.3f})".format(mejor_area))
+
+                elif estado_actual == "aproximando":
+                    if mejor_area >= DETECT_AREA_STOP:
+                        # Fase 2: detenerse
+                        cerebro.parada_activa = True
+                        cerebro.stop_state = "detenido"
+                        cerebro.stop_state_since = ahora
+                        enviar_comando("X", uart)
+                        print("[STOP] Detenido en stop (area={:.3f}). Esperando {}s".format(
+                            mejor_area, STOP_ESPERA_S))
+                    elif mejor_area < DETECT_AREA_APROX * 0.5:
+                        # Perdio el stop: volver a normal
+                        cerebro.stop_state = "normal"
+                        enviar_comando("HAZOFF", uart)
+                        enviar_comando("SET:driveSpeed={}".format(VELOCIDAD_AUTONOMA), uart)
+                        print("[STOP] Stop perdido, volviendo a normal")
+
+                elif estado_actual == "detenido":
+                    if (ahora - cerebro.stop_state_since) >= STOP_ESPERA_S:
+                        # Fin de espera: reanudar
+                        cerebro.stop_state = "cooldown"
+                        cerebro.parada_activa = False
+                        enviar_comando("HAZOFF", uart)
+                        enviar_comando("SET:driveSpeed={}".format(VELOCIDAD_AUTONOMA), uart)
+                        enviar_comando("W", uart)
+                        cerebro.ultimo_comando = "W"
+                        stop_cooldown_end = ahora + STOP_COOLDOWN_S
+                        print("[STOP] Reanudando circuito (cooldown {}s)".format(STOP_COOLDOWN_S))
+
+                elif estado_actual == "cooldown":
+                    if ahora >= stop_cooldown_end:
+                        cerebro.stop_state = "normal"
+                        print("[STOP] Cooldown terminado, deteccion activa de nuevo")
+
+
+def loop_deteccion(uart):
+    """Wrapper con manejo de excepciones para el hilo de deteccion."""
+    try:
+        _loop_deteccion_inner(uart)
+    except Exception as e:
+        print("[DETECT] Hilo de deteccion murio:", e)
+        traceback.print_exc()
+        # No es fatal: el hilo de carril sigue funcionando
 
 
 def _loop_inteligencia_inner(uart):
@@ -363,8 +621,15 @@ def _loop_inteligencia_inner(uart):
                         print("[LF] Timeout {}s, forzando salida de line-follow".format(
                             LF_TIMEOUT_S))
 
-                # Decision de direccion con centroide ponderado (solo si NO en LF)
-                if not cerebro.modo_LF:
+                # Compartir frame con el hilo de deteccion cada N frames
+                if frames_total % DETECT_FEED_INTERVALO == 0:
+                    with cerebro.frame_detect_lock:
+                        cerebro.frame_detect = img_rgb.copy()
+                    cerebro.frame_detect_event.set()
+
+                # Decision de direccion con centroide ponderado
+                # (solo si NO en LF y NO en parada por señal)
+                if not cerebro.modo_LF and not cerebro.parada_activa:
                     if centroid_error < -UMBRAL_ERROR_GIRO:
                         nuevo_cmd = "A"   # masa a la izquierda -> girar izquierda
                     elif centroid_error > UMBRAL_ERROR_GIRO:
@@ -652,6 +917,10 @@ if __name__ == "__main__":
 
     t_tel = threading.Thread(target=loop_lectura_telemetria, args=(_uart_global,), daemon=True)
     t_tel.start()
+
+    # Hilo de deteccion de señales (detect-supremo.hef) - usa su propio VDevice
+    t_det = threading.Thread(target=loop_deteccion, args=(_uart_global,), daemon=True)
+    t_det.start()
 
     # Esperar a que el hilo de IA arranque o falle. Hailo puede tardar
     # varios segundos en cargar el modelo, asi que damos 10 segundos.
