@@ -11,12 +11,7 @@ from tkinter import ttk, messagebox
 DEFAULT_HOST = "192.168.4.1"
 DEFAULT_PORT = 8080
 
-
 # Lista de sliders de calibracion que aparecen en el panel derecho.
-# Cada entrada es (clave, etiqueta visible, minimo, maximo, valor inicial).
-# La clave es la misma que entiende el firmware en applyParam(), asi al
-# mover el slider se manda "SET:clave=valor" por TCP y el ESP32 ajusta
-# el parametro en vivo sin reflashear.
 SLIDERS = [
     ("driveSpeed",       "Velocidad manual (PWM)",        0,    255,  200),
     ("parkDriveSpeed",   "Velocidad estacionar (PWM)",    0,    255,  200),
@@ -31,7 +26,6 @@ SLIDERS = [
     ("distParaYaCm",     "Dist. para ya (banqueta)",      2,    30,   8),
     ("tAvanzarHuecoMs",  "Override avance tras hueco ms", 0,    5000, 0),
     ("minHuecoStableMs", "Hueco estable min (ms)",        0,    2000, 250),
-    # Geometria fisica del carro y parametros de la maniobra automatica.
     ("carLargoCm",       "Largo del carro (cm)",          5,    100,  29),
     ("carAnchoCm",       "Ancho del carro (cm)",          5,    50,   14),
     ("carAltoCm",        "Alto del carro (cm)",           5,    50,   25),
@@ -81,8 +75,6 @@ class CarControllerGUI:
                         background="#e53935", foreground="white")
         style.map("Estop.TButton", background=[("active", "#ff5252")])
 
-        # Estado del socket TCP. self.sock vive en el thread del listener;
-        # las escrituras se hacen desde el thread de Tkinter usando un lock.
         self.sock = None
         self.sock_lock = threading.Lock()
         self.connected = False
@@ -104,8 +96,9 @@ class CarControllerGUI:
         self.root.bind("<KeyRelease>", self.on_key_release)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
-    # Construye toda la interfaz: tres columnas (estado, controles,
-    # calibracion). Se llama una sola vez desde __init__.
+        # MODIFICACION APLICADA: Iniciar el latido para evitar el timeout del ESP32
+        self._keep_alive()
+
     def _build_ui(self):
         outer = ttk.Frame(self.root, padding=10)
         outer.pack(fill="both", expand=True)
@@ -127,14 +120,12 @@ class CarControllerGUI:
         conn = ttk.LabelFrame(parent, text="Conexion (TCP)", padding=10)
         conn.pack(fill="x", pady=(0, 8))
 
-        # Fila 1: host:port editables
         addr_row = ttk.Frame(conn); addr_row.pack(fill="x")
         ttk.Label(addr_row, text="Host:", width=6).pack(side="left")
         ttk.Entry(addr_row, textvariable=self.host_var, width=14).pack(side="left", padx=(0,6))
         ttk.Label(addr_row, text="Puerto:").pack(side="left")
         ttk.Entry(addr_row, textvariable=self.port_var, width=6).pack(side="left", padx=(4,0))
 
-        # Fila 2: status + botones
         st_row = ttk.Frame(conn); st_row.pack(fill="x", pady=(8,0))
         self.lbl_status = ttk.Label(st_row, text="Desconectado",
                                     font=("Segoe UI", 10, "bold"),
@@ -147,8 +138,7 @@ class CarControllerGUI:
         st = ttk.LabelFrame(parent, text="Estado", padding=10)
         st.pack(fill="x", pady=(0, 8))
 
-        self.state_canvas = tk.Canvas(st, height=70, bg="#9e9e9e",
-                                      highlightthickness=0)
+        self.state_canvas = tk.Canvas(st, height=70, bg="#9e9e9e", highlightthickness=0)
         self.state_canvas.pack(fill="x")
         self.state_text = self.state_canvas.create_text(
             10, 35, anchor="w", text="MANUAL",
@@ -167,43 +157,35 @@ class CarControllerGUI:
 
         line = ttk.LabelFrame(parent, text="Seguidores de linea (TCRT5000)", padding=10)
         line.pack(fill="x", pady=(0, 8))
-        self.line_canvas = tk.Canvas(line, height=46, bg="#1e1e1e",
-                                     highlightthickness=0)
+        self.line_canvas = tk.Canvas(line, height=46, bg="#1e1e1e", highlightthickness=0)
         self.line_canvas.pack(fill="x")
-        # Tres circulos: izquierdo, centro, derecho
+
         self.line_dots = []
         labels = ["L", "C", "R"]
         for i, lab in enumerate(labels):
             x = 40 + i * 80
             dot = self.line_canvas.create_oval(x-15, 8, x+15, 38,
                                                fill="#424242", outline="#90caf9", width=2)
-            self.line_canvas.create_text(x, 23, text=lab,
-                                         font=("Segoe UI", 11, "bold"),
-                                         fill="#ffffff")
+            self.line_canvas.create_text(x, 23, text=lab, font=("Segoe UI", 11, "bold"), fill="#ffffff")
             self.line_dots.append(dot)
 
         dr = ttk.LabelFrame(parent, text="Direccion (estimada)", padding=10)
         dr.pack(fill="x", pady=(0, 8))
 
-        self.lbl_steer_pos = ttk.Label(dr, text="200 ms",
-                                       font=("Segoe UI", 12, "bold"))
+        self.lbl_steer_pos = ttk.Label(dr, text="200 ms", font=("Segoe UI", 12, "bold"))
         self.lbl_steer_pos.pack(anchor="w")
 
-        self.steer_bar = tk.Canvas(dr, height=20, bg="#2a2a2a",
-                                   highlightthickness=0)
+        self.steer_bar = tk.Canvas(dr, height=20, bg="#2a2a2a", highlightthickness=0)
         self.steer_bar.pack(fill="x", pady=(4, 0))
-        self.steer_bar_rect = self.steer_bar.create_rectangle(
-            0, 0, 0, 20, fill="#42a5f5", width=0)
+        self.steer_bar_rect = self.steer_bar.create_rectangle(0, 0, 0, 20, fill="#42a5f5", width=0)
 
-        # Log de mensajes del ESP (muestra TODO lo que llega: UART, TCP, info)
         log_frame = ttk.LabelFrame(parent, text="Log ESP (en vivo)", padding=4)
         log_frame.pack(fill="both", expand=True, pady=(8, 0))
         self.log_text = tk.Text(log_frame, height=10, bg="#0d0d0d",
                                 fg="#80cbc4", font=("Consolas", 8),
                                 wrap="word", state="disabled",
                                 highlightthickness=0, borderwidth=0)
-        log_sb = ttk.Scrollbar(log_frame, orient="vertical",
-                               command=self.log_text.yview)
+        log_sb = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=log_sb.set)
         self.log_text.pack(side="left", fill="both", expand=True)
         log_sb.pack(side="right", fill="y")
@@ -212,8 +194,7 @@ class CarControllerGUI:
         row = ttk.Frame(parent)
         row.pack(fill="x", pady=2)
         ttk.Label(row, text=name + ":", width=10).pack(side="left")
-        lbl = ttk.Label(row, text=initial, font=("Consolas", 16, "bold"),
-                        foreground="#90caf9")
+        lbl = ttk.Label(row, text=initial, font=("Consolas", 16, "bold"), foreground="#90caf9")
         lbl.pack(side="left")
         return lbl
 
@@ -222,76 +203,40 @@ class CarControllerGUI:
         ctrl.pack(fill="x", pady=(0, 8))
 
         row1 = ttk.Frame(ctrl); row1.pack(fill="x", pady=3)
-        ttk.Button(row1, text="W\nForward", style="Big.TButton",
-                   command=lambda: self.send("W")
-                   ).pack(side="left", expand=True, fill="both", padx=2)
-        ttk.Button(row1, text="X\nStop", style="Big.TButton",
-                   command=lambda: self.send("X")
-                   ).pack(side="left", expand=True, fill="both", padx=2)
-        ttk.Button(row1, text="S\nReverse", style="Big.TButton",
-                   command=lambda: self.send("S")
-                   ).pack(side="left", expand=True, fill="both", padx=2)
+        ttk.Button(row1, text="W\nForward", style="Big.TButton", command=lambda: self.send("W")).pack(side="left", expand=True, fill="both", padx=2)
+        ttk.Button(row1, text="X\nStop", style="Big.TButton", command=lambda: self.send("X")).pack(side="left", expand=True, fill="both", padx=2)
+        ttk.Button(row1, text="S\nReverse", style="Big.TButton", command=lambda: self.send("S")).pack(side="left", expand=True, fill="both", padx=2)
 
         row2 = ttk.Frame(ctrl); row2.pack(fill="x", pady=3)
-        ttk.Button(row2, text="A\nLeft", style="Big.TButton",
-                   command=lambda: self.send("A")
-                   ).pack(side="left", expand=True, fill="both", padx=2)
-        ttk.Button(row2, text="C\nCenter", style="Big.TButton",
-                   command=lambda: self.send("C")
-                   ).pack(side="left", expand=True, fill="both", padx=2)
-        ttk.Button(row2, text="D\nRight", style="Big.TButton",
-                   command=lambda: self.send("D")
-                   ).pack(side="left", expand=True, fill="both", padx=2)
+        ttk.Button(row2, text="A\nLeft", style="Big.TButton", command=lambda: self.send("A")).pack(side="left", expand=True, fill="both", padx=2)
+        ttk.Button(row2, text="C\nCenter", style="Big.TButton", command=lambda: self.send("C")).pack(side="left", expand=True, fill="both", padx=2)
+        ttk.Button(row2, text="D\nRight", style="Big.TButton", command=lambda: self.send("D")).pack(side="left", expand=True, fill="both", padx=2)
 
         auto = ttk.LabelFrame(parent, text="Modo autonomo", padding=10)
         auto.pack(fill="x", pady=(0, 8))
 
         prow = ttk.Frame(auto); prow.pack(fill="x", pady=3)
-        ttk.Button(prow, text="Estacionar IZQUIERDA", style="Big.TButton",
-                   command=lambda: self.send("PL")
-                   ).pack(side="left", expand=True, fill="x", padx=2)
-        ttk.Button(prow, text="Estacionar DERECHA", style="Big.TButton",
-                   command=lambda: self.send("PR")
-                   ).pack(side="left", expand=True, fill="x", padx=2)
+        ttk.Button(prow, text="Estacionar IZQUIERDA", style="Big.TButton", command=lambda: self.send("PL")).pack(side="left", expand=True, fill="x", padx=2)
+        ttk.Button(prow, text="Estacionar DERECHA", style="Big.TButton", command=lambda: self.send("PR")).pack(side="left", expand=True, fill="x", padx=2)
 
         tprow = ttk.Frame(auto); tprow.pack(fill="x", pady=3)
-        ttk.Button(tprow, text="Test Park IZQ (ciego)",
-                   command=lambda: self.send("TPARKL")
-                   ).pack(side="left", expand=True, fill="x", padx=2)
-        ttk.Button(tprow, text="Test Park DER (ciego)",
-                   command=lambda: self.send("TPARKR")
-                   ).pack(side="left", expand=True, fill="x", padx=2)
+        ttk.Button(tprow, text="Test Park IZQ (ciego)", command=lambda: self.send("TPARKL")).pack(side="left", expand=True, fill="x", padx=2)
+        ttk.Button(tprow, text="Test Park DER (ciego)", command=lambda: self.send("TPARKR")).pack(side="left", expand=True, fill="x", padx=2)
 
         lfrow = ttk.Frame(auto); lfrow.pack(fill="x", pady=3)
-        ttk.Button(lfrow, text="Line Follow ON (LF)", style="Big.TButton",
-                   command=lambda: self.send("LF")
-                   ).pack(side="left", expand=True, fill="x", padx=2)
-        ttk.Button(lfrow, text="Line Follow OFF (NOLF)", style="Big.TButton",
-                   command=lambda: self.send("NOLF")
-                   ).pack(side="left", expand=True, fill="x", padx=2)
+        ttk.Button(lfrow, text="Line Follow ON (LF)", style="Big.TButton", command=lambda: self.send("LF")).pack(side="left", expand=True, fill="x", padx=2)
+        ttk.Button(lfrow, text="Line Follow OFF (NOLF)", style="Big.TButton", command=lambda: self.send("NOLF")).pack(side="left", expand=True, fill="x", padx=2)
 
         urow = ttk.Frame(auto); urow.pack(fill="x", pady=3)
-        ttk.Button(urow, text="Sensor Test (T)",
-                   command=lambda: self.send("T")
-                   ).pack(side="left", expand=True, fill="x", padx=2)
-        ttk.Button(urow, text="Hazards (H)",
-                   command=lambda: self.send("H")
-                   ).pack(side="left", expand=True, fill="x", padx=2)
-        ttk.Button(urow, text="Recalibrar (CAL)",
-                   command=lambda: self.send("CAL")
-                   ).pack(side="left", expand=True, fill="x", padx=2)
+        ttk.Button(urow, text="Sensor Test (T)", command=lambda: self.send("T")).pack(side="left", expand=True, fill="x", padx=2)
+        ttk.Button(urow, text="Hazards (H)", command=lambda: self.send("H")).pack(side="left", expand=True, fill="x", padx=2)
+        ttk.Button(urow, text="Recalibrar (CAL)", command=lambda: self.send("CAL")).pack(side="left", expand=True, fill="x", padx=2)
 
         estop = ttk.Frame(parent)
         estop.pack(fill="x", pady=(8, 0))
-        ttk.Button(estop, text="PARO DE EMERGENCIA",
-                   style="Estop.TButton",
-                   command=self.estop).pack(fill="x", ipady=6)
+        ttk.Button(estop, text="PARO DE EMERGENCIA", style="Estop.TButton", command=self.estop).pack(fill="x", ipady=6)
 
-        info = ttk.Label(parent,
-                         text="Tip: WASD con la ventana enfocada.\n"
-                              "Cualquier tecla durante AUTO o LF cancela.\n"
-                              "Esc = paro de emergencia.",
-                         justify="left", foreground="#9e9e9e")
+        info = ttk.Label(parent, text="Tip: WASD con la ventana enfocada.\nCualquier tecla durante AUTO o LF cancela.\nEsc = paro de emergencia.", justify="left", foreground="#9e9e9e")
         info.pack(anchor="w", pady=(8, 0))
 
     def _build_right(self, parent):
@@ -302,8 +247,7 @@ class CarControllerGUI:
         sb = ttk.Scrollbar(cal, orient="vertical", command=canvas.yview)
         inner = ttk.Frame(canvas)
 
-        inner.bind("<Configure>",
-                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.create_window((0, 0), window=inner, anchor="nw")
         canvas.configure(yscrollcommand=sb.set)
 
@@ -319,9 +263,7 @@ class CarControllerGUI:
 
         head = ttk.Frame(frm); head.pack(fill="x")
         ttk.Label(head, text=label, font=("Segoe UI", 9)).pack(side="left")
-        val_lbl = ttk.Label(head, text=str(default),
-                            font=("Consolas", 10, "bold"),
-                            foreground="#90caf9", width=6, anchor="e")
+        val_lbl = ttk.Label(head, text=str(default), font=("Consolas", 10, "bold"), foreground="#90caf9", width=6, anchor="e")
         val_lbl.pack(side="right")
 
         var = self.slider_vars[key]
@@ -331,14 +273,9 @@ class CarControllerGUI:
             val_lbl.config(text=str(v))
             self.send(f"SET:{key}={v}")
 
-        sc = ttk.Scale(frm, from_=mn, to=mx, orient="horizontal",
-                       variable=var, command=on_change)
+        sc = ttk.Scale(frm, from_=mn, to=mx, orient="horizontal", variable=var, command=on_change)
         sc.pack(fill="x")
 
-    # Conexion TCP
-    # El listener vive en un thread dedicado bloqueante. Lee lineas
-    # delimitadas por '\n' del socket y las pasa al handler. El thread
-    # de Tkinter solo escribe (con lock) y se actualiza via root.after.
     def connect(self):
         if self.connected:
             return
@@ -350,7 +287,7 @@ class CarControllerGUI:
 
         try:
             s = socket.create_connection((host, port), timeout=3)
-            s.settimeout(None)  # bloqueante despues del connect
+            s.settimeout(None)
         except Exception as e:
             self._set_status(False)
             messagebox.showerror("Error", f"No se pudo conectar a {host}:{port}\n{e}")
@@ -407,7 +344,6 @@ class CarControllerGUI:
                     continue
                 self._handle_message(text)
 
-        # Cerro el remoto o hubo error
         self.connected = False
         with self.sock_lock:
             self.sock = None
@@ -426,9 +362,6 @@ class CarControllerGUI:
                 self.sock = None
             self._set_status(False)
 
-    # Helpers de UI: actualizan widgets desde callbacks de Tkinter.
-    # Todo lo que toca widgets se enrutea por root.after para que
-    # corra en el thread principal aunque venga del listener.
     def _set_status(self, ok: bool):
         def _do():
             if ok:
@@ -438,13 +371,11 @@ class CarControllerGUI:
         self.root.after(0, _do)
 
     def _log(self, msg):
-        """Escribe una linea al panel de log (thread-safe)."""
         ts = time.strftime("%H:%M:%S")
         line = f"[{ts}] {msg}\n"
         def _do():
             self.log_text.configure(state="normal")
             self.log_text.insert("end", line)
-            # Limitar a 200 lineas para no comer memoria
             count = int(self.log_text.index("end-1c").split(".")[0])
             if count > 200:
                 self.log_text.delete("1.0", f"{count - 200}.0")
@@ -453,20 +384,16 @@ class CarControllerGUI:
         self.root.after(0, _do)
 
     def _handle_message(self, msg):
-        # Escribir TODO al log para diagnostico (incluye RX,UART,...
-        # INFO,..., ERR,..., telemetria JSON, etc).
-        # Filtramos solo la telemetria periodica para no spamear.
+        # MODIFICACION APLICADA: Redundancia limpiada en el chequeo
         if not msg.startswith("{"):
             self._log(msg)
-
-        if not msg.startswith("{"):
             return
+            
         try:
             j = json.loads(msg)
         except Exception:
             return
         if j.get("t") != "tel":
-            # Log de JSON no-telemetria (eventos, acks, etc)
             self._log(msg)
             return
         self._handle_telemetry(j)
@@ -478,7 +405,6 @@ class CarControllerGUI:
             self.lbl_B.config(text=str(j.get("B", "?")))
             self.lbl_F.config(text=str(j.get("F", "?")))
 
-            # Seguidores de linea: tres circulos. Verde = ve linea blanca.
             colors = []
             for key in ("lnL", "lnC", "lnR"):
                 colors.append("#66bb6a" if int(j.get(key, 0)) else "#424242")
@@ -505,10 +431,6 @@ class CarControllerGUI:
     def estop(self):
         self.send("ESTOP")
 
-    # Manejo de teclado
-    # WASD se mandan como comandos individuales al firmware (igual
-    # que los botones), y al soltar la tecla se envia "X" (parar
-    # tracion) o "C" (centrar direccion) segun el caso.
     def on_key_press(self, event):
         k = event.keysym.lower()
         if k in self.pressed:
@@ -529,6 +451,22 @@ class CarControllerGUI:
             self.send("X")
         if k in ("a", "d"):
             self.send("C")
+
+    # MODIFICACION APLICADA: Funcion de latido para el keep-alive.
+    def _keep_alive(self):
+        """Envía repetidamente el comando de la tecla presionada cada 500ms."""
+        if self.connected and self.pressed:
+            if "w" in self.pressed:
+                self.send("W")
+            elif "s" in self.pressed:
+                self.send("S")
+            elif "a" in self.pressed:
+                self.send("A")
+            elif "d" in self.pressed:
+                self.send("D")
+                
+        # Programar el siguiente latido sin bloquear la interfaz
+        self.root.after(500, self._keep_alive)
 
     def on_close(self):
         try:

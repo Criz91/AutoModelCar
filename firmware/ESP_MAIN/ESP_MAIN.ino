@@ -3,7 +3,7 @@
 // Tres canales de comunicacion conviven:
 //   - WiFi AP + TCP puerto 8080  -> GUI de la laptop (teleop, tuning, parking)
 //   - UART2 (RX=16, TX=17)       -> Raspberry Pi 5 con Hailo (IA carril)
-//   - Serial USB                  -> debug
+//   - Serial USB                 -> debug
 //
 // Modos:
 //   MANUAL       - control manual WASD desde GUI o desde Pi
@@ -182,16 +182,6 @@ unsigned long lfCruceStart = 0;  // 0=normal, >0=en espera de cruce peatonal
 unsigned long lfSlowUntil  = 0;  // frenar en curva hasta este timestamp
 
 // VARIABLES TEST PARK (prueba ciega sin ultrasonicos)
-// Paso 0: calibrar volante (blocking) + 3 parpadeos de LED como countdown
-// Paso 1: esperar a que el volante quede centrado antes de avanzar
-// Paso 2: avanzar recto 1m
-// Paso 3: frenar y girar volante al tope
-// Paso 4: esperar a que el volante termine de girar
-// Paso 5: reversa con giro (tReversaGiroMs)
-// Paso 6: frenar y enderezar volante
-// Paso 7: esperar a que el volante quede centrado
-// Paso 8: reversa recta (1 segundo)
-// Paso 9: frenar -> ESTACIONADO
 int  tpStep = 0;
 int  tpSide = +1;
 unsigned long tpStepStart = 0;
@@ -706,23 +696,6 @@ void parkingLoop() {
 }
 
 // LINE FOLLOW - corrige direccion con TCRT5000
-// La Pi entra a este modo cuando Hailo pierde el carril en una curva
-// cerrada (manda "LF") y sale cuando lo recupera (manda "NOLF"). El bucle
-// de control vive en el ESP a 100 Hz para que no haya delay de USB+Pi.
-//
-// Convencion lnX = 1 significa "este sensor ve la linea blanca".
-// Tabla de decision (centro, izquierdo, derecho):
-//
-//   C=1 L=0 R=0  ->  recto         (steerCenter)
-//   C=1 L=1 R=0  ->  ajuste izq leve
-//   C=1 L=0 R=1  ->  ajuste der leve
-//   C=0 L=1 R=0  ->  girar izq fuerte
-//   C=0 L=0 R=1  ->  girar der fuerte
-//   C=0 L=1 R=1  ->  cruce / interseccion -> mantener
-//   C=0 L=0 R=0  ->  perdio linea -> mantener (muy lento)
-//   C=1 L=1 R=1  ->  parche / mancha -> mantener
-//
-// Velocidad de crucero menor que la manual para tener tiempo de reaccion.
 void startLineFollow() {
   if (mode == AUTO_PARK) {
     publishLine("ERR,LF_BLOCKED_BY_AUTO_PARK");
@@ -824,23 +797,6 @@ void lineFollowLoop() {
 }
 
 // TEST PARK - prueba ciega de la maniobra de estacionamiento en bateria
-// Ejecuta la secuencia completa con tiempos fijos para que puedas ver
-// fisicamente que hace cada paso. Manda "TPARKR" o "TPARKL" desde la GUI.
-// Para cancelar, manda cualquier comando manual (W/S/X/A/D/ESTOP).
-//
-// Secuencia TPARKR (derecha):
-//   Paso 0: LEDs parpadean 3 veces (countdown). No mueve nada.
-//   Paso 1: Avanzar recto 1 metro. Frenar.
-//   Paso 2: Encender intermitentes, detenerse 500ms.
-//   Paso 3: Volante a la IZQUIERDA + avanzar al mismo tiempo, 1 segundo.
-//           (abre el carro alejandose del cajon)
-//   Paso 4: Volante FULL DERECHA + reversa al mismo tiempo, 2 segundos.
-//           (mete la cola al cajon)
-//   Paso 5: Enderezar volante + seguir en reversa, 5 segundos.
-//           (termina de meter el carro derecho)
-//   Paso 6: Frenar. Hazards = ESTACIONADO.
-//
-// TPARKL (izquierda) invierte las direcciones.
 void startTestPark(int side) {
   if (mode == AUTO_PARK) {
     publishLine("ERR,TPARK_BLOCKED_BY_AUTO_PARK");
@@ -853,10 +809,6 @@ void startTestPark(int side) {
   hazardMode = 0;
   parkState = IDLE;
 
-  // No hacemos steerCalibrateHome() - eso causa el movimiento raro.
-  // Asumimos que el volante ya esta mas o menos centrado.
-  // Si quieres recalibrar, usa el boton CAL antes de correr el test.
-
   publishLine(String("INFO,TPARK_START,") + (side > 0 ? "RIGHT" : "LEFT"));
   publishLine("INFO,TPARK_PASO_0,COUNTDOWN_LEDS");
 }
@@ -867,7 +819,6 @@ void testParkLoop() {
   unsigned long elapsed = millis() - tpStepStart;
 
   switch (tpStep) {
-    // Paso 0: 3 parpadeos de LED como countdown (2 seg). No mueve nada.
     case 0: {
       driveStop();
       int blinkPhase = (int)(elapsed / 333);
@@ -890,7 +841,6 @@ void testParkLoop() {
       break;
     }
 
-    // Paso 1: avanzar recto 1 metro (usa distInicialCm / cmPorSegPark)
     case 1: {
       driveForwardKick(P.parkDriveSpeed);
       int tAvance = tAvanceInicialMsEff();
@@ -905,14 +855,10 @@ void testParkLoop() {
       break;
     }
 
-    // Paso 2: detenerse 500ms con intermitentes encendidos
     case 2: {
       driveStop();
       if (elapsed > 500) {
         hazardMode = 0;
-        // Girar volante al lado CONTRARIO del estacionamiento y avanzar
-        // TPARKR: volante a la IZQUIERDA para abrir el carro
-        // TPARKL: volante a la DERECHA
         if (tpSide > 0) steerFullLeft();
         else steerFullRight();
         armKickStart();
@@ -924,15 +870,10 @@ void testParkLoop() {
       break;
     }
 
-    // Paso 3: avanzar con volante girado al lado contrario, 1 segundo
-    // Esto abre el carro alejandose del cajon (maniobra de apertura)
     case 3: {
       driveForwardKick(P.parkDriveSpeed);
       if (elapsed > 1000) {
         driveStop();
-        // Ahora girar volante al lado DEL estacionamiento (full)
-        // TPARKR: volante FULL DERECHA
-        // TPARKL: volante FULL IZQUIERDA
         if (tpSide > 0) steerFullRight();
         else steerFullLeft();
         armKickStart();
@@ -944,13 +885,10 @@ void testParkLoop() {
       break;
     }
 
-    // Paso 4: reversa con volante girado al lado del cajon, 2 segundos
-    // Esto mete la cola del carro al cajon
     case 4: {
       driveReverseKick(P.parkDriveSpeed);
       if (elapsed > 2000) {
         driveStop();
-        // Enderezar: llevar volante al centro
         steerCenter();
         armKickStart();
         tpStep = 5;
@@ -961,8 +899,6 @@ void testParkLoop() {
       break;
     }
 
-    // Paso 5: reversa con volante centrado, 5 segundos
-    // Esto termina de meter el carro derecho al cajon
     case 5: {
       driveReverseKick((int)(P.parkDriveSpeed * 0.75));
       if (elapsed > 5000) {
@@ -1013,16 +949,10 @@ void applyParam(const String& k, int v) {
 }
 
 // PARSER DE COMANDOS
-// Comandos soportados (TCP, UART y Serial USB):
-//   W S X A D C            - movimiento manual
-//   PR PL                  - estacionar derecha / izquierda
-//   LF NOLF                - entrar / salir de line follow
-//   TPARKR TPARKL           - prueba ciega de estacionamiento
-//   T H CAL ESTOP          - test sensores, hazards, calibrar, paro
-//   SET:clave=valor        - ajustar parametro en vivo
-//   PING                   - heartbeat (responde PONG)
 void handleCommand(String cmd, const String& sourceName) {
   cmd.trim();
+  cmd.toUpperCase(); // <--- SOLUCION APLICADA PARA FORZAR MAYUSCULAS
+  
   if (cmd.length() == 0) return;
 
   lastAnyCmdMs = millis();
@@ -1041,12 +971,11 @@ void handleCommand(String cmd, const String& sourceName) {
     return;
   }
 
-  if (cmd.equalsIgnoreCase("PING")) {
+  if (cmd.equals("PING")) {
     publishLine("PONG");
     return;
   }
 
-  // Cualquier comando manual durante AUTO_PARK o TEST_PARK lo cancela
   if (mode == AUTO_PARK && cmd != "PR" && cmd != "PL") {
     abortParking("manual_override");
   }
@@ -1057,7 +986,6 @@ void handleCommand(String cmd, const String& sourceName) {
     parkState = ABORTADO;
   }
 
-  // Cualquier comando manual de movimiento durante LF tambien lo cancela
   if (mode == LINE_FOLLOW &&
       (cmd == "W" || cmd == "S" || cmd == "X" ||
        cmd == "A" || cmd == "D" || cmd == "C" ||
@@ -1165,9 +1093,6 @@ void readUARTCommands() {
 }
 
 // TIMEOUT DE SEGURIDAD GLOBAL
-// Si no llega ningun comando en 1.5 s, frena. NO se aplica durante
-// AUTO_PARK ni durante LINE_FOLLOW (esos modos son autonomos y no
-// dependen de comandos externos continuos).
 void handleGlobalTimeout() {
   if (mode == AUTO_PARK)   return;
   if (mode == LINE_FOLLOW) return;
