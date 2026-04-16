@@ -214,6 +214,9 @@ def _loop_inteligencia_inner(uart):
     contador_cuadros = 0
     blackout_cnt = 0
     recover_cnt = 0
+    frames_total = 0
+    lf_start_time = 0       # timestamp de cuando entro a LF
+    LF_TIMEOUT_S = 10       # si lleva 10s en LF sin recuperar, salir
 
     with network_group.activate():
         params = [
@@ -227,6 +230,7 @@ def _loop_inteligencia_inner(uart):
                 # Captura y pre-procesado
                 frame_raw = picam2.capture_array()
                 contador_cuadros += 1
+                frames_total += 1
 
                 if frame_raw.shape[-1] == 4:
                     img_rgb = cv2.cvtColor(frame_raw, cv2.COLOR_RGBA2RGB)
@@ -253,6 +257,16 @@ def _loop_inteligencia_inner(uart):
                 z5 = np.sum(mask[:, seccion * 4:]) / factor
                 actividad_total = z1 + z2 + z3 + z4 + z5
 
+                # Diagnostico: imprimir estado cada ~30 frames (~1 seg)
+                if frames_total % 30 == 0:
+                    print(
+                        "[IA] frame={} act={:.2f} cmd={} LF={} bo={} rc={}".format(
+                            frames_total, actividad_total,
+                            cerebro.ultimo_comando or "-",
+                            cerebro.modo_LF, blackout_cnt, recover_cnt
+                        )
+                    )
+
                 # Deteccion de blackout / recovery
                 if actividad_total < UMBRAL_ACTIVIDAD:
                     blackout_cnt += 1
@@ -261,6 +275,7 @@ def _loop_inteligencia_inner(uart):
                         enviar_comando("LF", uart)
                         cerebro.modo_LF = True
                         cerebro.ultimo_comando = "LF"
+                        lf_start_time = time.time()
                         print("[LF] Blackout detectado, entrando a line-follow")
                 else:
                     blackout_cnt = 0
@@ -272,9 +287,22 @@ def _loop_inteligencia_inner(uart):
                                 cerebro.modo_LF = False
                                 cerebro.ultimo_comando = ""
                                 recover_cnt = 0
+                                lf_start_time = 0
                                 print("[LF] Carril recuperado, volviendo a Hailo")
                         else:
                             recover_cnt = 0
+
+                # Timeout LF: si lleva mucho tiempo en LF sin recuperar,
+                # forzar salida para no quedarse atorado
+                if cerebro.modo_LF and lf_start_time > 0:
+                    if (time.time() - lf_start_time) > LF_TIMEOUT_S:
+                        enviar_comando("NOLF", uart)
+                        cerebro.modo_LF = False
+                        cerebro.ultimo_comando = ""
+                        lf_start_time = 0
+                        blackout_cnt = 0
+                        print("[LF] Timeout {}s, forzando salida de line-follow".format(
+                            LF_TIMEOUT_S))
 
                 # Toma de decision normal (solo si NO estamos en LF)
                 if (not cerebro.modo_LF) and contador_cuadros >= FRECUENCIA_ENVIO:
@@ -484,8 +512,10 @@ if __name__ == "__main__":
     t_tel = threading.Thread(target=loop_lectura_telemetria, args=(_uart_global,), daemon=True)
     t_tel.start()
 
-    # Esperar un poco a que el hilo de IA arranque o falle
-    time.sleep(3)
+    # Esperar a que el hilo de IA arranque o falle. Hailo puede tardar
+    # varios segundos en cargar el modelo, asi que damos 10 segundos.
+    print("[..] Esperando a que el hilo de IA arranque (hasta 10s)...")
+    time.sleep(10)
     if cerebro.error_fatal:
         print()
         print("El hilo de IA no pudo arrancar:")

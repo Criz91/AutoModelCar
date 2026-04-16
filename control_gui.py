@@ -1,6 +1,7 @@
 import json
 import socket
 import threading
+import time
 import tkinter as tk
 from tkinter import ttk, messagebox
 
@@ -193,6 +194,19 @@ class CarControllerGUI:
         self.steer_bar.pack(fill="x", pady=(4, 0))
         self.steer_bar_rect = self.steer_bar.create_rectangle(
             0, 0, 0, 20, fill="#42a5f5", width=0)
+
+        # Log de mensajes del ESP (muestra TODO lo que llega: UART, TCP, info)
+        log_frame = ttk.LabelFrame(parent, text="Log ESP (en vivo)", padding=4)
+        log_frame.pack(fill="both", expand=True, pady=(8, 0))
+        self.log_text = tk.Text(log_frame, height=10, bg="#0d0d0d",
+                                fg="#80cbc4", font=("Consolas", 8),
+                                wrap="word", state="disabled",
+                                highlightthickness=0, borderwidth=0)
+        log_sb = ttk.Scrollbar(log_frame, orient="vertical",
+                               command=self.log_text.yview)
+        self.log_text.configure(yscrollcommand=log_sb.set)
+        self.log_text.pack(side="left", fill="both", expand=True)
+        log_sb.pack(side="right", fill="y")
 
     def _mk_big_label(self, parent, name, initial):
         row = ttk.Frame(parent)
@@ -423,10 +437,28 @@ class CarControllerGUI:
                 self.lbl_status.config(text="Desconectado", foreground="#e57373")
         self.root.after(0, _do)
 
+    def _log(self, msg):
+        """Escribe una linea al panel de log (thread-safe)."""
+        ts = time.strftime("%H:%M:%S")
+        line = f"[{ts}] {msg}\n"
+        def _do():
+            self.log_text.configure(state="normal")
+            self.log_text.insert("end", line)
+            # Limitar a 200 lineas para no comer memoria
+            count = int(self.log_text.index("end-1c").split(".")[0])
+            if count > 200:
+                self.log_text.delete("1.0", f"{count - 200}.0")
+            self.log_text.see("end")
+            self.log_text.configure(state="disabled")
+        self.root.after(0, _do)
+
     def _handle_message(self, msg):
-        # El firmware manda telemetria como JSON y otras lineas como
-        # texto plano (RX,..., INFO,..., ERR,...). Solo nos interesa
-        # parsear las que empiezan con '{' como JSON.
+        # Escribir TODO al log para diagnostico (incluye RX,UART,...
+        # INFO,..., ERR,..., telemetria JSON, etc).
+        # Filtramos solo la telemetria periodica para no spamear.
+        if not msg.startswith("{"):
+            self._log(msg)
+
         if not msg.startswith("{"):
             return
         try:
@@ -434,6 +466,8 @@ class CarControllerGUI:
         except Exception:
             return
         if j.get("t") != "tel":
+            # Log de JSON no-telemetria (eventos, acks, etc)
+            self._log(msg)
             return
         self._handle_telemetry(j)
 

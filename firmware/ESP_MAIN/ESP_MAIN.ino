@@ -764,11 +764,24 @@ void lineFollowLoop() {
   }
 }
 
-// TEST PARK - prueba ciega de la maniobra sin ultrasonicos
+// TEST PARK - prueba ciega de la maniobra de estacionamiento en bateria
 // Ejecuta la secuencia completa con tiempos fijos para que puedas ver
-// fisicamente que hace cada paso. Manda "TPARKR" o "TPARKL" desde la GUI
-// o por serial. Cada paso se anuncia con publishLine().
+// fisicamente que hace cada paso. Manda "TPARKR" o "TPARKL" desde la GUI.
 // Para cancelar, manda cualquier comando manual (W/S/X/A/D/ESTOP).
+//
+// Secuencia TPARKR (derecha):
+//   Paso 0: LEDs parpadean 3 veces (countdown). No mueve nada.
+//   Paso 1: Avanzar recto 1 metro. Frenar.
+//   Paso 2: Encender intermitentes, detenerse 500ms.
+//   Paso 3: Volante a la IZQUIERDA + avanzar al mismo tiempo, 1 segundo.
+//           (abre el carro alejandose del cajon)
+//   Paso 4: Volante FULL DERECHA + reversa al mismo tiempo, 2 segundos.
+//           (mete la cola al cajon)
+//   Paso 5: Enderezar volante + seguir en reversa, 5 segundos.
+//           (termina de meter el carro derecho)
+//   Paso 6: Frenar. Hazards = ESTACIONADO.
+//
+// TPARKL (izquierda) invierte las direcciones.
 void startTestPark(int side) {
   if (mode == AUTO_PARK) {
     publishLine("ERR,TPARK_BLOCKED_BY_AUTO_PARK");
@@ -776,17 +789,14 @@ void startTestPark(int side) {
   }
   tpSide = side;
   tpStep = 0;
-  tpBlinks = 0;
   tpStepStart = millis();
   mode = TEST_PARK;
   hazardMode = 0;
   parkState = IDLE;
 
-  // Calibracion: fuerza volante a tope izquierdo (blocking) para tener
-  // una referencia conocida de posicion. Esto tarda ~650ms.
-  steerCalibrateHome();
-  // Ahora mandamos el volante al centro (non-blocking)
-  steerCenter();
+  // No hacemos steerCalibrateHome() - eso causa el movimiento raro.
+  // Asumimos que el volante ya esta mas o menos centrado.
+  // Si quieres recalibrar, usa el boton CAL antes de correr el test.
 
   publishLine(String("INFO,TPARK_START,") + (side > 0 ? "RIGHT" : "LEFT"));
   publishLine("INFO,TPARK_PASO_0,COUNTDOWN_LEDS");
@@ -798,12 +808,10 @@ void testParkLoop() {
   unsigned long elapsed = millis() - tpStepStart;
 
   switch (tpStep) {
-    // Paso 0: countdown con 3 parpadeos de LED + esperar a que el
-    // volante termine de centrarse. No avanza nada todavia.
+    // Paso 0: 3 parpadeos de LED como countdown (2 seg). No mueve nada.
     case 0: {
       driveStop();
-      // Parpadear LEDs cada 600ms (3 parpadeos = 1.8s)
-      int blinkPhase = (int)(elapsed / 300);  // 0,1,2,3,4,5 (on/off/on/off/on/off)
+      int blinkPhase = (int)(elapsed / 333);
       if (blinkPhase % 2 == 0) {
         digitalWrite(LED_L, HIGH);
         digitalWrite(LED_R, HIGH);
@@ -811,111 +819,98 @@ void testParkLoop() {
         digitalWrite(LED_L, LOW);
         digitalWrite(LED_R, LOW);
       }
-      // Despues de 2 segundos y volante quieto, avanzar
-      if (elapsed > 2000 && !steerBusy()) {
+      if (elapsed > 2000) {
         digitalWrite(LED_L, LOW);
         digitalWrite(LED_R, LOW);
         armKickStart();
         tpStep = 1;
         tpStepStart = millis();
-        publishLine("INFO,TPARK_PASO_1,AVANCE_RECTO_1M");
+        publishLine("INFO,TPARK_PASO_1,AVANCE_RECTO");
         parkState = AVANCE_INICIAL;
       }
       break;
     }
 
-    // Paso 1: avanzar recto durante distInicialCm / cmPorSegPark
+    // Paso 1: avanzar recto 1 metro (usa distInicialCm / cmPorSegPark)
     case 1: {
       driveForwardKick(P.parkDriveSpeed);
       int tAvance = tAvanceInicialMsEff();
       if (elapsed > (unsigned long)tAvance) {
         driveStop();
+        hazardMode = 1;  // encender intermitentes
         tpStep = 2;
         tpStepStart = millis();
-        publishLine("INFO,TPARK_PASO_2,FRENANDO_500MS");
+        publishLine("INFO,TPARK_PASO_2,FRENO_CON_HAZARDS");
         parkState = AVANZAR_PASA_HUECO;
       }
       break;
     }
 
-    // Paso 2: pausa de 500ms y luego mandar el volante a tope
+    // Paso 2: detenerse 500ms con intermitentes encendidos
     case 2: {
       driveStop();
       if (elapsed > 500) {
-        if (tpSide > 0) steerFullRight();
-        else steerFullLeft();
+        hazardMode = 0;
+        // Girar volante al lado CONTRARIO del estacionamiento y avanzar
+        // TPARKR: volante a la IZQUIERDA para abrir el carro
+        // TPARKL: volante a la DERECHA
+        if (tpSide > 0) steerFullLeft();
+        else steerFullRight();
+        armKickStart();
         tpStep = 3;
         tpStepStart = millis();
-        publishLine("INFO,TPARK_PASO_3,GIRANDO_VOLANTE");
+        publishLine("INFO,TPARK_PASO_3,AVANCE_CON_GIRO_OPUESTO_1S");
         parkState = STOP_Y_GIRAR;
       }
       break;
     }
 
-    // Paso 3: esperar a que el volante llegue a tope
+    // Paso 3: avanzar con volante girado al lado contrario, 1 segundo
+    // Esto abre el carro alejandose del cajon (maniobra de apertura)
     case 3: {
-      driveStop();
-      if (!steerBusy()) {
-        publishLine("INFO,TPARK_VOLANTE_EN_TOPE");
+      driveForwardKick(P.parkDriveSpeed);
+      if (elapsed > 1000) {
+        driveStop();
+        // Ahora girar volante al lado DEL estacionamiento (full)
+        // TPARKR: volante FULL DERECHA
+        // TPARKL: volante FULL IZQUIERDA
+        if (tpSide > 0) steerFullRight();
+        else steerFullLeft();
         armKickStart();
         tpStep = 4;
         tpStepStart = millis();
-        publishLine("INFO,TPARK_PASO_4,REVERSA_CON_GIRO");
-        parkState = REVERSA_GIRO;
-      }
-      if (elapsed > 2000) {
-        publishLine("WARN,TPARK_STEER_TIMEOUT");
-        armKickStart();
-        tpStep = 4;
-        tpStepStart = millis();
+        publishLine("INFO,TPARK_PASO_4,REVERSA_CON_GIRO_2S");
         parkState = REVERSA_GIRO;
       }
       break;
     }
 
-    // Paso 4: reversa con volante girado durante tReversaGiroMs
+    // Paso 4: reversa con volante girado al lado del cajon, 2 segundos
+    // Esto mete la cola del carro al cajon
     case 4: {
       driveReverseKick(P.parkDriveSpeed);
-      if (elapsed > (unsigned long)P.tReversaGiroMs) {
+      if (elapsed > 2000) {
         driveStop();
+        // Enderezar: llevar volante al centro
         steerCenter();
+        armKickStart();
         tpStep = 5;
         tpStepStart = millis();
-        publishLine("INFO,TPARK_PASO_5,ENDEREZANDO");
-        parkState = STOP_Y_ENDEREZAR;
+        publishLine("INFO,TPARK_PASO_5,REVERSA_RECTA_5S");
+        parkState = REVERSA_RECTA;
       }
       break;
     }
 
-    // Paso 5: esperar a que el volante vuelva al centro
+    // Paso 5: reversa con volante centrado, 5 segundos
+    // Esto termina de meter el carro derecho al cajon
     case 5: {
-      driveStop();
-      if (!steerBusy()) {
-        publishLine("INFO,TPARK_VOLANTE_CENTRADO");
-        armKickStart();
-        tpStep = 6;
-        tpStepStart = millis();
-        publishLine("INFO,TPARK_PASO_6,REVERSA_RECTA");
-        parkState = REVERSA_RECTA;
-      }
-      if (elapsed > 2000) {
-        publishLine("WARN,TPARK_CENTER_TIMEOUT");
-        armKickStart();
-        tpStep = 6;
-        tpStepStart = millis();
-        parkState = REVERSA_RECTA;
-      }
-      break;
-    }
-
-    // Paso 6: reversa recta por 1.2 segundos a velocidad reducida
-    case 6: {
-      driveReverseKick((int)(P.parkDriveSpeed * 0.7));
-      if (elapsed > 1200) {
+      driveReverseKick((int)(P.parkDriveSpeed * 0.75));
+      if (elapsed > 5000) {
         driveStop();
-        tpStep = 7;
+        tpStep = 6;
         tpStepStart = millis();
-        publishLine("INFO,TPARK_PASO_7,FIN");
+        publishLine("INFO,TPARK_PASO_6,FIN");
         parkState = ESTACIONADO;
         finishParking();
       }
