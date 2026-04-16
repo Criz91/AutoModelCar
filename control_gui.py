@@ -5,13 +5,9 @@ import time
 import tkinter as tk
 from tkinter import ttk, messagebox
 
-# Conexion al ESP32 (puerto TCP que abre el firmware unificado).
-# El reglamento del TMR prohibe comunicacion cableada con procesamiento
-# externo, asi que la GUI siempre se conecta por WiFi al AP del ESP.
 DEFAULT_HOST = "192.168.4.1"
 DEFAULT_PORT = 8080
 
-# Lista de sliders de calibracion que aparecen en el panel derecho.
 SLIDERS = [
     ("driveSpeed",       "Velocidad manual (PWM)",        0,    255,  200),
     ("parkDriveSpeed",   "Velocidad estacionar (PWM)",    0,    255,  200),
@@ -59,21 +55,20 @@ class CarControllerGUI:
 
         style = ttk.Style()
         style.theme_use("clam")
-        style.configure(".",
-                        background="#1e1e1e", foreground="#e0e0e0",
-                        fieldbackground="#2a2a2a")
+        style.configure(".", background="#1e1e1e", foreground="#e0e0e0", fieldbackground="#2a2a2a")
         style.configure("TLabel", background="#1e1e1e", foreground="#e0e0e0")
         style.configure("TLabelframe", background="#1e1e1e", foreground="#e0e0e0")
-        style.configure("TLabelframe.Label", background="#1e1e1e",
-                        foreground="#90caf9", font=("Segoe UI", 10, "bold"))
+        style.configure("TLabelframe.Label", background="#1e1e1e", foreground="#90caf9", font=("Segoe UI", 10, "bold"))
         style.configure("TFrame", background="#1e1e1e")
         style.configure("TEntry", fieldbackground="#2a2a2a", foreground="#e0e0e0")
         style.configure("TButton", padding=6, font=("Segoe UI", 9))
         style.configure("Big.TButton", padding=10, font=("Segoe UI", 11, "bold"))
-        style.configure("Estop.TButton", padding=14,
-                        font=("Segoe UI", 13, "bold"),
-                        background="#e53935", foreground="white")
+        style.configure("Estop.TButton", padding=14, font=("Segoe UI", 13, "bold"), background="#e53935", foreground="white")
         style.map("Estop.TButton", background=[("active", "#ff5252")])
+        
+        # Estilo para el freno
+        style.configure("Brake.TButton", padding=10, font=("Segoe UI", 11, "bold"), background="#d32f2f", foreground="white")
+        style.map("Brake.TButton", background=[("active", "#f44336")])
 
         self.sock = None
         self.sock_lock = threading.Lock()
@@ -96,7 +91,6 @@ class CarControllerGUI:
         self.root.bind("<KeyRelease>", self.on_key_release)
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
-        # MODIFICACION APLICADA: Iniciar el latido para evitar el timeout del ESP32
         self._keep_alive()
 
     def _build_ui(self):
@@ -127,9 +121,7 @@ class CarControllerGUI:
         ttk.Entry(addr_row, textvariable=self.port_var, width=6).pack(side="left", padx=(4,0))
 
         st_row = ttk.Frame(conn); st_row.pack(fill="x", pady=(8,0))
-        self.lbl_status = ttk.Label(st_row, text="Desconectado",
-                                    font=("Segoe UI", 10, "bold"),
-                                    foreground="#e57373")
+        self.lbl_status = ttk.Label(st_row, text="Desconectado", font=("Segoe UI", 10, "bold"), foreground="#e57373")
         self.lbl_status.pack(side="left")
 
         ttk.Button(st_row, text="Conectar",    command=self.connect   ).pack(side="right", padx=3)
@@ -140,12 +132,8 @@ class CarControllerGUI:
 
         self.state_canvas = tk.Canvas(st, height=70, bg="#9e9e9e", highlightthickness=0)
         self.state_canvas.pack(fill="x")
-        self.state_text = self.state_canvas.create_text(
-            10, 35, anchor="w", text="MANUAL",
-            font=("Segoe UI", 18, "bold"), fill="white")
-        self.substate_text = self.state_canvas.create_text(
-            10, 58, anchor="w", text="-",
-            font=("Segoe UI", 9), fill="white")
+        self.state_text = self.state_canvas.create_text(10, 35, anchor="w", text="MANUAL", font=("Segoe UI", 18, "bold"), fill="white")
+        self.substate_text = self.state_canvas.create_text(10, 58, anchor="w", text="-", font=("Segoe UI", 9), fill="white")
 
         sens = ttk.LabelFrame(parent, text="Ultrasonicos (cm)", padding=10)
         sens.pack(fill="x", pady=(0, 8))
@@ -164,8 +152,7 @@ class CarControllerGUI:
         labels = ["L", "C", "R"]
         for i, lab in enumerate(labels):
             x = 40 + i * 80
-            dot = self.line_canvas.create_oval(x-15, 8, x+15, 38,
-                                               fill="#424242", outline="#90caf9", width=2)
+            dot = self.line_canvas.create_oval(x-15, 8, x+15, 38, fill="#424242", outline="#90caf9", width=2)
             self.line_canvas.create_text(x, 23, text=lab, font=("Segoe UI", 11, "bold"), fill="#ffffff")
             self.line_dots.append(dot)
 
@@ -181,10 +168,7 @@ class CarControllerGUI:
 
         log_frame = ttk.LabelFrame(parent, text="Log ESP (en vivo)", padding=4)
         log_frame.pack(fill="both", expand=True, pady=(8, 0))
-        self.log_text = tk.Text(log_frame, height=10, bg="#0d0d0d",
-                                fg="#80cbc4", font=("Consolas", 8),
-                                wrap="word", state="disabled",
-                                highlightthickness=0, borderwidth=0)
+        self.log_text = tk.Text(log_frame, height=10, bg="#0d0d0d", fg="#80cbc4", font=("Consolas", 8), wrap="word", state="disabled", highlightthickness=0, borderwidth=0)
         log_sb = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=log_sb.set)
         self.log_text.pack(side="left", fill="both", expand=True)
@@ -215,13 +199,14 @@ class CarControllerGUI:
         auto = ttk.LabelFrame(parent, text="Modo autonomo", padding=10)
         auto.pack(fill="x", pady=(0, 8))
 
+        # MODIFICACION: Botones para seleccionar el modo de inteligencia
+        ia_modes = ttk.Frame(auto); ia_modes.pack(fill="x", pady=3)
+        ttk.Button(ia_modes, text="Modo IA: Solo Camara", command=lambda: self.send("IA_ONLY")).pack(side="left", expand=True, fill="x", padx=2)
+        ttk.Button(ia_modes, text="Modo IA + Sensores Piso", command=lambda: self.send("IA_LF")).pack(side="left", expand=True, fill="x", padx=2)
+
         prow = ttk.Frame(auto); prow.pack(fill="x", pady=3)
         ttk.Button(prow, text="Estacionar IZQUIERDA", style="Big.TButton", command=lambda: self.send("PL")).pack(side="left", expand=True, fill="x", padx=2)
         ttk.Button(prow, text="Estacionar DERECHA", style="Big.TButton", command=lambda: self.send("PR")).pack(side="left", expand=True, fill="x", padx=2)
-
-        tprow = ttk.Frame(auto); tprow.pack(fill="x", pady=3)
-        ttk.Button(tprow, text="Test Park IZQ (ciego)", command=lambda: self.send("TPARKL")).pack(side="left", expand=True, fill="x", padx=2)
-        ttk.Button(tprow, text="Test Park DER (ciego)", command=lambda: self.send("TPARKR")).pack(side="left", expand=True, fill="x", padx=2)
 
         lfrow = ttk.Frame(auto); lfrow.pack(fill="x", pady=3)
         ttk.Button(lfrow, text="Line Follow ON (LF)", style="Big.TButton", command=lambda: self.send("LF")).pack(side="left", expand=True, fill="x", padx=2)
@@ -234,6 +219,13 @@ class CarControllerGUI:
 
         estop = ttk.Frame(parent)
         estop.pack(fill="x", pady=(8, 0))
+        
+        # MODIFICACION: Botón de freno interactivo (Pin 41)
+        brake_btn = ttk.Button(estop, text="FRENO / LUCES 41 (Mantener presionado)", style="Brake.TButton")
+        brake_btn.pack(fill="x", ipady=6, pady=(0, 4))
+        brake_btn.bind("<ButtonPress-1>", lambda e: self.send("BRAKE_ON"))
+        brake_btn.bind("<ButtonRelease-1>", lambda e: self.send("BRAKE_OFF"))
+
         ttk.Button(estop, text="PARO DE EMERGENCIA", style="Estop.TButton", command=self.estop).pack(fill="x", ipady=6)
 
         info = ttk.Label(parent, text="Tip: WASD con la ventana enfocada.\nCualquier tecla durante AUTO o LF cancela.\nEsc = paro de emergencia.", justify="left", foreground="#9e9e9e")
@@ -280,10 +272,8 @@ class CarControllerGUI:
         if self.connected:
             return
         host = self.host_var.get().strip() or DEFAULT_HOST
-        try:
-            port = int(self.port_var.get())
-        except ValueError:
-            port = DEFAULT_PORT
+        try: port = int(self.port_var.get())
+        except ValueError: port = DEFAULT_PORT
 
         try:
             s = socket.create_connection((host, port), timeout=3)
@@ -293,11 +283,9 @@ class CarControllerGUI:
             messagebox.showerror("Error", f"No se pudo conectar a {host}:{port}\n{e}")
             return
 
-        with self.sock_lock:
-            self.sock = s
+        with self.sock_lock: self.sock = s
         self.connected = True
         self._set_status(True)
-
         self.stop_listener.clear()
         self.listener_thread = threading.Thread(target=self._listen_loop, daemon=True)
         self.listener_thread.start()
@@ -308,66 +296,46 @@ class CarControllerGUI:
             s = self.sock
             self.sock = None
         if s:
-            try:
-                s.shutdown(socket.SHUT_RDWR)
-            except Exception:
-                pass
-            try:
-                s.close()
-            except Exception:
-                pass
+            try: s.shutdown(socket.SHUT_RDWR)
+            except Exception: pass
+            try: s.close()
+            except Exception: pass
         self.connected = False
         self._set_status(False)
 
     def _listen_loop(self):
         buf = b""
         while not self.stop_listener.is_set():
-            with self.sock_lock:
-                s = self.sock
-            if s is None:
-                break
-            try:
-                chunk = s.recv(4096)
-            except OSError:
-                break
-            if not chunk:
-                break
+            with self.sock_lock: s = self.sock
+            if s is None: break
+            try: chunk = s.recv(4096)
+            except OSError: break
+            if not chunk: break
             buf += chunk
             while b"\n" in buf:
                 line, buf = buf.split(b"\n", 1)
                 line = line.strip()
-                if not line:
-                    continue
-                try:
-                    text = line.decode("utf-8", errors="replace")
-                except Exception:
-                    continue
+                if not line: continue
+                try: text = line.decode("utf-8", errors="replace")
+                except Exception: continue
                 self._handle_message(text)
-
         self.connected = False
-        with self.sock_lock:
-            self.sock = None
+        with self.sock_lock: self.sock = None
         self._set_status(False)
 
     def send(self, msg: str):
-        with self.sock_lock:
-            s = self.sock
-        if s is None:
-            return
-        try:
-            s.sendall((msg + "\n").encode("utf-8"))
+        with self.sock_lock: s = self.sock
+        if s is None: return
+        try: s.sendall((msg + "\n").encode("utf-8"))
         except OSError:
             self.connected = False
-            with self.sock_lock:
-                self.sock = None
+            with self.sock_lock: self.sock = None
             self._set_status(False)
 
     def _set_status(self, ok: bool):
         def _do():
-            if ok:
-                self.lbl_status.config(text="Conectado", foreground="#81c784")
-            else:
-                self.lbl_status.config(text="Desconectado", foreground="#e57373")
+            if ok: self.lbl_status.config(text="Conectado", foreground="#81c784")
+            else: self.lbl_status.config(text="Desconectado", foreground="#e57373")
         self.root.after(0, _do)
 
     def _log(self, msg):
@@ -377,22 +345,17 @@ class CarControllerGUI:
             self.log_text.configure(state="normal")
             self.log_text.insert("end", line)
             count = int(self.log_text.index("end-1c").split(".")[0])
-            if count > 200:
-                self.log_text.delete("1.0", f"{count - 200}.0")
+            if count > 200: self.log_text.delete("1.0", f"{count - 200}.0")
             self.log_text.see("end")
             self.log_text.configure(state="disabled")
         self.root.after(0, _do)
 
     def _handle_message(self, msg):
-        # MODIFICACION APLICADA: Redundancia limpiada en el chequeo
         if not msg.startswith("{"):
             self._log(msg)
             return
-            
-        try:
-            j = json.loads(msg)
-        except Exception:
-            return
+        try: j = json.loads(msg)
+        except Exception: return
         if j.get("t") != "tel":
             self._log(msg)
             return
@@ -406,10 +369,8 @@ class CarControllerGUI:
             self.lbl_F.config(text=str(j.get("F", "?")))
 
             colors = []
-            for key in ("lnL", "lnC", "lnR"):
-                colors.append("#66bb6a" if int(j.get(key, 0)) else "#424242")
-            for dot, col in zip(self.line_dots, colors):
-                self.line_canvas.itemconfig(dot, fill=col)
+            for key in ("lnL", "lnC", "lnR"): colors.append("#66bb6a" if int(j.get(key, 0)) else "#424242")
+            for dot, col in zip(self.line_dots, colors): self.line_canvas.itemconfig(dot, fill=col)
 
             sp = int(j.get("sp", 0))
             self.lbl_steer_pos.config(text=f"{sp} ms")
@@ -425,18 +386,14 @@ class CarControllerGUI:
             self.state_canvas.config(bg=color)
             self.state_canvas.itemconfig(self.state_text, text=mode)
             self.state_canvas.itemconfig(self.substate_text, text=sub)
-
         self.root.after(0, _do)
 
-    def estop(self):
-        self.send("ESTOP")
+    def estop(self): self.send("ESTOP")
 
     def on_key_press(self, event):
         k = event.keysym.lower()
-        if k in self.pressed:
-            return
+        if k in self.pressed: return
         self.pressed.add(k)
-
         if k == "w":      self.send("W")
         elif k == "s":    self.send("S")
         elif k == "a":    self.send("A")
@@ -446,36 +403,22 @@ class CarControllerGUI:
     def on_key_release(self, event):
         k = event.keysym.lower()
         self.pressed.discard(k)
+        if k in ("w", "s"): self.send("X")
+        if k in ("a", "d"): self.send("C")
 
-        if k in ("w", "s"):
-            self.send("X")
-        if k in ("a", "d"):
-            self.send("C")
-
-    # MODIFICACION APLICADA: Funcion de latido para el keep-alive.
     def _keep_alive(self):
-        """Envía repetidamente el comando de la tecla presionada cada 500ms."""
         if self.connected and self.pressed:
-            if "w" in self.pressed:
-                self.send("W")
-            elif "s" in self.pressed:
-                self.send("S")
-            elif "a" in self.pressed:
-                self.send("A")
-            elif "d" in self.pressed:
-                self.send("D")
-                
-        # Programar el siguiente latido sin bloquear la interfaz
+            if "w" in self.pressed: self.send("W")
+            elif "s" in self.pressed: self.send("S")
+            elif "a" in self.pressed: self.send("A")
+            elif "d" in self.pressed: self.send("D")
         self.root.after(500, self._keep_alive)
 
     def on_close(self):
-        try:
-            self.estop()
-        except Exception:
-            pass
+        try: self.estop()
+        except Exception: pass
         self.disconnect()
         self.root.destroy()
-
 
 if __name__ == "__main__":
     root = tk.Tk()
