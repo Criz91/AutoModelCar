@@ -60,8 +60,8 @@ IMG_SIZE = 640  # tamano de entrada de la red lane
 # ---------------- Velocidades ----------------
 # Recta, curva suave y curva fuerte
 VELOCIDAD_AUTONOMA_RECTA = 180
-VELOCIDAD_AUTONOMA_CURVA = 145
-VELOCIDAD_AUTONOMA_CURVA_FUERTE = 125
+VELOCIDAD_AUTONOMA_CURVA = 150
+VELOCIDAD_AUTONOMA_CURVA_FUERTE = 140
 
 # Velocidad usada cuando se detecta un stop y se va aproximando
 VELOCIDAD_APROX = 140
