@@ -175,18 +175,20 @@ int  lfLastSteerTarget = -1;  // -1 = sin objetivo previo, evita refire
 unsigned long lfStart = 0;
 
 // VARIABLES TEST PARK (prueba ciega sin ultrasonicos)
-// Paso 0: avanzar recto 1m
-// Paso 1: frenar y esperar a que el volante este quieto
-// Paso 2: girar volante a tope
-// Paso 3: esperar a que termine de girar
-// Paso 4: reversa con giro (tReversaGiroMs)
-// Paso 5: frenar y enderezar
-// Paso 6: esperar a que termine de enderezar
-// Paso 7: reversa recta (1 segundo)
-// Paso 8: frenar -> ESTACIONADO
+// Paso 0: calibrar volante (blocking) + 3 parpadeos de LED como countdown
+// Paso 1: esperar a que el volante quede centrado antes de avanzar
+// Paso 2: avanzar recto 1m
+// Paso 3: frenar y girar volante al tope
+// Paso 4: esperar a que el volante termine de girar
+// Paso 5: reversa con giro (tReversaGiroMs)
+// Paso 6: frenar y enderezar volante
+// Paso 7: esperar a que el volante quede centrado
+// Paso 8: reversa recta (1 segundo)
+// Paso 9: frenar -> ESTACIONADO
 int  tpStep = 0;
-int  tpSide = +1;  // +1 derecha, -1 izquierda
+int  tpSide = +1;
 unsigned long tpStepStart = 0;
+int  tpBlinks = 0;
 
 // TELEMETRIA Y TIEMPOS
 unsigned long lastTelemetryMs = 0;
@@ -774,17 +776,20 @@ void startTestPark(int side) {
   }
   tpSide = side;
   tpStep = 0;
+  tpBlinks = 0;
   tpStepStart = millis();
   mode = TEST_PARK;
-  hazardMode = 2;
-  parkState = AVANCE_INICIAL;
+  hazardMode = 0;
+  parkState = IDLE;
 
+  // Calibracion: fuerza volante a tope izquierdo (blocking) para tener
+  // una referencia conocida de posicion. Esto tarda ~650ms.
   steerCalibrateHome();
+  // Ahora mandamos el volante al centro (non-blocking)
   steerCenter();
-  armKickStart();
 
   publishLine(String("INFO,TPARK_START,") + (side > 0 ? "RIGHT" : "LEFT"));
-  publishLine("INFO,TPARK_PASO_0,AVANCE_1M");
+  publishLine("INFO,TPARK_PASO_0,COUNTDOWN_LEDS");
 }
 
 void testParkLoop() {
@@ -793,101 +798,126 @@ void testParkLoop() {
   unsigned long elapsed = millis() - tpStepStart;
 
   switch (tpStep) {
-    // Paso 0: avanzar recto durante el tiempo correspondiente a distInicialCm
+    // Paso 0: countdown con 3 parpadeos de LED + esperar a que el
+    // volante termine de centrarse. No avanza nada todavia.
     case 0: {
+      driveStop();
+      // Parpadear LEDs cada 600ms (3 parpadeos = 1.8s)
+      int blinkPhase = (int)(elapsed / 300);  // 0,1,2,3,4,5 (on/off/on/off/on/off)
+      if (blinkPhase % 2 == 0) {
+        digitalWrite(LED_L, HIGH);
+        digitalWrite(LED_R, HIGH);
+      } else {
+        digitalWrite(LED_L, LOW);
+        digitalWrite(LED_R, LOW);
+      }
+      // Despues de 2 segundos y volante quieto, avanzar
+      if (elapsed > 2000 && !steerBusy()) {
+        digitalWrite(LED_L, LOW);
+        digitalWrite(LED_R, LOW);
+        armKickStart();
+        tpStep = 1;
+        tpStepStart = millis();
+        publishLine("INFO,TPARK_PASO_1,AVANCE_RECTO_1M");
+        parkState = AVANCE_INICIAL;
+      }
+      break;
+    }
+
+    // Paso 1: avanzar recto durante distInicialCm / cmPorSegPark
+    case 1: {
       driveForwardKick(P.parkDriveSpeed);
       int tAvance = tAvanceInicialMsEff();
       if (elapsed > (unsigned long)tAvance) {
         driveStop();
-        tpStep = 1;
+        tpStep = 2;
         tpStepStart = millis();
-        publishLine("INFO,TPARK_PASO_1,FRENANDO");
+        publishLine("INFO,TPARK_PASO_2,FRENANDO_500MS");
         parkState = AVANZAR_PASA_HUECO;
       }
       break;
     }
 
-    // Paso 1: pausa breve de 500ms (simula encontrar hueco + avanzar un poco)
-    case 1: {
+    // Paso 2: pausa de 500ms y luego mandar el volante a tope
+    case 2: {
       driveStop();
       if (elapsed > 500) {
-        // Girar volante al lado correspondiente
         if (tpSide > 0) steerFullRight();
         else steerFullLeft();
-        tpStep = 2;
+        tpStep = 3;
         tpStepStart = millis();
-        publishLine("INFO,TPARK_PASO_2,GIRANDO_VOLANTE");
+        publishLine("INFO,TPARK_PASO_3,GIRANDO_VOLANTE");
         parkState = STOP_Y_GIRAR;
       }
       break;
     }
 
-    // Paso 2: esperar a que el volante termine de girar
-    case 2: {
+    // Paso 3: esperar a que el volante llegue a tope
+    case 3: {
       driveStop();
       if (!steerBusy()) {
+        publishLine("INFO,TPARK_VOLANTE_EN_TOPE");
         armKickStart();
-        tpStep = 3;
+        tpStep = 4;
         tpStepStart = millis();
-        publishLine("INFO,TPARK_PASO_3,REVERSA_CON_GIRO");
+        publishLine("INFO,TPARK_PASO_4,REVERSA_CON_GIRO");
         parkState = REVERSA_GIRO;
       }
-      // Timeout: si el volante no termina en 2s, algo esta mal
       if (elapsed > 2000) {
         publishLine("WARN,TPARK_STEER_TIMEOUT");
         armKickStart();
-        tpStep = 3;
+        tpStep = 4;
         tpStepStart = millis();
         parkState = REVERSA_GIRO;
       }
       break;
     }
 
-    // Paso 3: reversa con volante girado durante tReversaGiroMs
-    case 3: {
+    // Paso 4: reversa con volante girado durante tReversaGiroMs
+    case 4: {
       driveReverseKick(P.parkDriveSpeed);
       if (elapsed > (unsigned long)P.tReversaGiroMs) {
         driveStop();
         steerCenter();
-        tpStep = 4;
+        tpStep = 5;
         tpStepStart = millis();
-        publishLine("INFO,TPARK_PASO_4,ENDEREZANDO");
+        publishLine("INFO,TPARK_PASO_5,ENDEREZANDO");
         parkState = STOP_Y_ENDEREZAR;
       }
       break;
     }
 
-    // Paso 4: esperar a que el volante se enderece
-    case 4: {
+    // Paso 5: esperar a que el volante vuelva al centro
+    case 5: {
       driveStop();
       if (!steerBusy()) {
+        publishLine("INFO,TPARK_VOLANTE_CENTRADO");
         armKickStart();
-        tpStep = 5;
+        tpStep = 6;
         tpStepStart = millis();
-        publishLine("INFO,TPARK_PASO_5,REVERSA_RECTA");
+        publishLine("INFO,TPARK_PASO_6,REVERSA_RECTA");
         parkState = REVERSA_RECTA;
       }
       if (elapsed > 2000) {
         publishLine("WARN,TPARK_CENTER_TIMEOUT");
         armKickStart();
-        tpStep = 5;
+        tpStep = 6;
         tpStepStart = millis();
         parkState = REVERSA_RECTA;
       }
       break;
     }
 
-    // Paso 5: reversa recta por 1 segundo
-    case 5: {
+    // Paso 6: reversa recta por 1.2 segundos a velocidad reducida
+    case 6: {
       driveReverseKick((int)(P.parkDriveSpeed * 0.7));
-      if (elapsed > 1000) {
+      if (elapsed > 1200) {
         driveStop();
-        tpStep = 6;
+        tpStep = 7;
         tpStepStart = millis();
-        publishLine("INFO,TPARK_PASO_6,FIN");
+        publishLine("INFO,TPARK_PASO_7,FIN");
         parkState = ESTACIONADO;
         finishParking();
-        mode = MANUAL;  // finishParking ya hace esto, pero por claridad
       }
       break;
     }
