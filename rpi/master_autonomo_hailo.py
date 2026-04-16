@@ -14,20 +14,27 @@ Comandos enviados al ESP (texto plano, terminado en '\n'):
     LF  entrar a modo line-follow local del ESP (curva cerrada)
     NOLF salir de modo line-follow y volver a control desde la Pi
 
-Logica de handoff Hailo <-> Line Follow:
-    - Si las 5 zonas verticales del mask suman menos que UMBRAL_ACTIVIDAD
-      durante BLACKOUT_FRAMES seguidos, asumimos que la IA perdio las
-      lineas (curva cerrada) y mandamos LF al ESP. Mientras estamos en LF
-      la Pi NO manda W/A/D/X, el ESP se controla solo con los TCRT5000.
-    - Cuando volvemos a ver carril con histeresis (suma > UMBRAL * 1.5)
-      durante RECOVER_FRAMES seguidos, mandamos NOLF y retomamos control.
+Algoritmo de decision de carril (grid ponderado):
+    El frame se divide en una cuadricula de FILAS x 5 columnas.
+    Las filas de abajo (mas cerca del carro) pesan mas que las de arriba
+    (curva lejana). Con esos pesos se calcula el centroide horizontal
+    del carril detectado: un numero de -1 (todo a la izquierda) a +1
+    (todo a la derecha). Eso se mapea a A / W / D con histeresis para
+    no cambiar de comando en cada frame y evitar zigzag.
 
-El servidor FastAPI en puerto 5000 expone un MJPEG con visualizacion de
-zonas y comando actual, util para debug remoto desde la laptop por WiFi.
+    VELOCIDAD_AUTONOMA: la Pi baja la velocidad del ESP al arrancar para
+    que el procesamiento de Hailo pueda seguir el ritmo del movimiento.
+
+Handoff Hailo <-> Line Follow (cuando los seguidores esten conectados):
+    Si la actividad del mask baja del umbral por varios frames seguidos,
+    se asume que la IA perdio el carril (curva cerrada) y se manda LF.
+    El ESP entonces usa los TCRT5000 localmente. Cuando la IA recupera
+    el carril, manda NOLF y retoma el control.
 
 Uso:
-    python3 master_autonomo_hailo.py           # modo normal
-    python3 master_autonomo_hailo.py --test    # prueba UART y camara sin Hailo
+    python3 master_autonomo_hailo.py              # modo normal
+    python3 master_autonomo_hailo.py --test       # prueba UART y camara
+    python3 master_autonomo_hailo.py --test-drive # secuencia W/A/D sin IA
 """
 
 import os
@@ -75,12 +82,37 @@ BAUD_RATE = 115200
 PUERTOS_UART_CANDIDATOS = ["/dev/serial0", "/dev/ttyAMA0", "/dev/ttyS0"]
 
 IMG_SIZE = 640            # tamano de entrada de la red
-FRECUENCIA_ENVIO = 3      # procesar N frames antes de tomar decision
-UMBRAL_ACTIVIDAD = 0.5    # minimo de actividad (suma escalada de zonas)
 
-BLACKOUT_FRAMES = 3       # frames consecutivos sin carril -> entra a LF
-RECOVER_FRAMES = 4        # frames consecutivos con carril -> sale de LF
-HISTERESIS = 1.5          # multiplicador del umbral para recuperarse
+# Velocidad del ESP cuando la IA esta en control. Se manda como SET al
+# arrancar. Mas baja que el default (200) para que Hailo tenga tiempo de
+# procesar. Ajustar segun que tan rapido se mueve el carro en pista.
+VELOCIDAD_AUTONOMA = 195
+
+# Grid de decision: numero de filas horizontales en que se divide el frame.
+# La fila de abajo (GRID_FILAS-1) pesa mas, la de arriba pesa menos.
+# Aumentar GRID_FILAS da mas resolucion vertical pero mas calculo.
+GRID_FILAS   = 4
+GRID_COLS    = 5    # columnas: izq-izq / izq / centro / der / der-der
+
+# Pesos de cada fila (de arriba hacia abajo). El ultimo valor es la fila
+# mas cercana al carro y debe pesar mas.
+PESOS_FILAS  = [0.1, 0.3, 0.6, 1.0]   # debe tener GRID_FILAS elementos
+
+# Umbral de actividad normalizada [0..1]. Si la actividad total del grid
+# baja de esto, el carril se considera perdido.
+UMBRAL_ACTIVIDAD = 0.05
+
+# Error maximo del centroide para considerar que el carro va recto.
+# Un error fuera de este rango manda A o D.
+UMBRAL_ERROR_GIRO = 0.30   # rango [-1,1]; 0.30 = 30% desviado
+
+# Suavizado: cuantos frames consecutivos con el mismo comando se necesitan
+# antes de cambiar a otro. Evita zigzag por ruido en la mascara.
+CONFIRMACIONES_CAMBIO = 2
+
+BLACKOUT_FRAMES = 5       # frames consecutivos sin carril -> entra a LF
+RECOVER_FRAMES  = 4       # frames consecutivos con carril -> sale de LF
+HISTERESIS      = 1.5     # multiplicador del umbral para recuperarse
 
 
 class CarroCerebro:
@@ -211,12 +243,17 @@ def _loop_inteligencia_inner(uart):
     input_name = hef.get_input_vstream_infos()[0].name
     print("[OK] Hailo listo. Input:", input_name)
 
-    contador_cuadros = 0
+    # Bajar velocidad del ESP para que Hailo pueda seguir el ritmo del carro
+    enviar_comando("SET:driveSpeed={}".format(VELOCIDAD_AUTONOMA), uart)
+    print("[OK] Velocidad autonoma enviada: driveSpeed={}".format(VELOCIDAD_AUTONOMA))
+
     blackout_cnt = 0
     recover_cnt = 0
     frames_total = 0
     lf_start_time = 0       # timestamp de cuando entro a LF
     LF_TIMEOUT_S = 10       # si lleva 10s en LF sin recuperar, salir
+    cmd_candidato_prev = "" # ultimo candidato para suavizado
+    confirmaciones = 0      # frames consecutivos con el mismo candidato
 
     with network_group.activate():
         params = [
@@ -229,7 +266,6 @@ def _loop_inteligencia_inner(uart):
             while not cerebro.stop_event.is_set():
                 # Captura y pre-procesado
                 frame_raw = picam2.capture_array()
-                contador_cuadros += 1
                 frames_total += 1
 
                 if frame_raw.shape[-1] == 4:
@@ -246,29 +282,52 @@ def _loop_inteligencia_inner(uart):
                 out = pipe.infer(input_data)
                 mask = list(out.values())[0][0].astype(np.float32)
 
-                # Segmentacion en 5 rebanadas verticales
+                # --- Grid ponderado GRID_FILAS x GRID_COLS ---
                 h, w = mask.shape[:2]
-                seccion = w // 5
-                factor = 10000
-                z1 = np.sum(mask[:, :seccion]) / factor
-                z2 = np.sum(mask[:, seccion:seccion * 2]) / factor
-                z3 = np.sum(mask[:, seccion * 2:seccion * 3]) / factor
-                z4 = np.sum(mask[:, seccion * 3:seccion * 4]) / factor
-                z5 = np.sum(mask[:, seccion * 4:]) / factor
-                actividad_total = z1 + z2 + z3 + z4 + z5
+                row_h = h // GRID_FILAS
+                col_w = w // GRID_COLS
+                # Posicion horizontal normalizada de cada columna: -1 (izq) a +1 (der)
+                col_pos = np.linspace(-1.0, 1.0, GRID_COLS)
 
-                # Diagnostico: imprimir estado cada ~30 frames (~1 seg)
+                numerador    = 0.0
+                denominador  = 0.0
+                actividad_total = 0.0
+
+                for r in range(GRID_FILAS):
+                    peso_r = PESOS_FILAS[r]
+                    r0 = r * row_h
+                    r1 = (r + 1) * row_h if r < GRID_FILAS - 1 else h
+                    for c in range(GRID_COLS):
+                        c0 = c * col_w
+                        c1 = (c + 1) * col_w if c < GRID_COLS - 1 else w
+                        suma_celda = float(np.sum(mask[r0:r1, c0:c1]))
+                        actividad_total += suma_celda
+                        celda_ponderada  = suma_celda * peso_r
+                        numerador   += celda_ponderada * col_pos[c]
+                        denominador += celda_ponderada
+
+                # Actividad media normalizada por pixeles (independiente del
+                # rango de valores de la mascara; UMBRAL_ACTIVIDAD en misma escala)
+                actividad_norm = actividad_total / (h * w) if h * w > 0 else 0.0
+
+                # Centroide horizontal ponderado: -1 = todo izq, +1 = todo der
+                if denominador > 0.0:
+                    centroid_error = float(np.clip(numerador / denominador, -1.0, 1.0))
+                else:
+                    centroid_error = 0.0
+
+                # Diagnostico cada ~30 frames (~1 seg)
                 if frames_total % 30 == 0:
                     print(
-                        "[IA] frame={} act={:.2f} cmd={} LF={} bo={} rc={}".format(
-                            frames_total, actividad_total,
+                        "[IA] frame={} act={:.3f} err={:+.2f} cmd={} LF={} bo={} rc={}".format(
+                            frames_total, actividad_norm, centroid_error,
                             cerebro.ultimo_comando or "-",
                             cerebro.modo_LF, blackout_cnt, recover_cnt
                         )
                     )
 
                 # Deteccion de blackout / recovery
-                if actividad_total < UMBRAL_ACTIVIDAD:
+                if actividad_norm < UMBRAL_ACTIVIDAD:
                     blackout_cnt += 1
                     recover_cnt = 0
                     if blackout_cnt >= BLACKOUT_FRAMES and not cerebro.modo_LF:
@@ -280,7 +339,7 @@ def _loop_inteligencia_inner(uart):
                 else:
                     blackout_cnt = 0
                     if cerebro.modo_LF:
-                        if actividad_total > UMBRAL_ACTIVIDAD * HISTERESIS:
+                        if actividad_norm > UMBRAL_ACTIVIDAD * HISTERESIS:
                             recover_cnt += 1
                             if recover_cnt >= RECOVER_FRAMES:
                                 enviar_comando("NOLF", uart)
@@ -304,35 +363,43 @@ def _loop_inteligencia_inner(uart):
                         print("[LF] Timeout {}s, forzando salida de line-follow".format(
                             LF_TIMEOUT_S))
 
-                # Toma de decision normal (solo si NO estamos en LF)
-                if (not cerebro.modo_LF) and contador_cuadros >= FRECUENCIA_ENVIO:
-                    comando_decidido = "W"
+                # Decision de direccion con centroide ponderado (solo si NO en LF)
+                if not cerebro.modo_LF:
+                    if centroid_error < -UMBRAL_ERROR_GIRO:
+                        nuevo_cmd = "A"   # masa a la izquierda -> girar izquierda
+                    elif centroid_error > UMBRAL_ERROR_GIRO:
+                        nuevo_cmd = "D"   # masa a la derecha  -> girar derecha
+                    else:
+                        nuevo_cmd = "W"   # centrado           -> avanzar recto
 
-                    if z3 > z2 and z3 > z4 and z3 > UMBRAL_ACTIVIDAD:
-                        comando_decidido = "W"
-                    elif (z1 + z2) > (z4 + z5) and (z1 + z2) > UMBRAL_ACTIVIDAD:
-                        comando_decidido = "A"
-                    elif (z4 + z5) > (z1 + z2) and (z4 + z5) > UMBRAL_ACTIVIDAD:
-                        comando_decidido = "D"
-                    elif actividad_total < UMBRAL_ACTIVIDAD:
-                        comando_decidido = "X"
+                    # Suavizado: solo cambiar comando si se confirma N frames
+                    if nuevo_cmd == cmd_candidato_prev:
+                        confirmaciones += 1
+                    else:
+                        confirmaciones = 1
+                        cmd_candidato_prev = nuevo_cmd
 
-                    if comando_decidido != cerebro.ultimo_comando:
-                        enviar_comando(comando_decidido, uart)
-                        cerebro.ultimo_comando = comando_decidido
+                    if (confirmaciones >= CONFIRMACIONES_CAMBIO and
+                            nuevo_cmd != cerebro.ultimo_comando):
+                        enviar_comando(nuevo_cmd, uart)
+                        cerebro.ultimo_comando = nuevo_cmd
+                        confirmaciones = 0
 
-                    contador_cuadros = 0
-
-                # Visualizacion para el monitor web
+                # --- Visualizacion para el monitor web ---
                 frame_viz = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
-                for i in range(1, 5):
-                    cv2.line(
-                        frame_viz,
-                        (i * (640 // 5), 0),
-                        (i * (640 // 5), 480),
-                        (255, 255, 0),
-                        1,
-                    )
+
+                # Cuadricula del grid (gris horizontal, amarillo vertical)
+                for r in range(1, GRID_FILAS):
+                    y = r * (480 // GRID_FILAS)
+                    cv2.line(frame_viz, (0, y), (640, y), (80, 80, 80), 1)
+                for c in range(1, GRID_COLS):
+                    x = c * (640 // GRID_COLS)
+                    cv2.line(frame_viz, (x, 0), (x, 480), (255, 255, 0), 1)
+
+                # Linea del centroide (verde) y linea central de referencia (rojo)
+                cx = int((centroid_error + 1.0) / 2.0 * 640)
+                cv2.line(frame_viz, (cx, 0), (cx, 480), (0, 255, 0), 2)
+                cv2.line(frame_viz, (320, 0), (320, 480), (0, 0, 200), 1)
 
                 color_orden = (0, 255, 0) if not cerebro.modo_LF else (0, 165, 255)
                 cv2.putText(
@@ -346,8 +413,8 @@ def _loop_inteligencia_inner(uart):
                 )
                 cv2.putText(
                     frame_viz,
-                    "Z3: {:.1f}".format(z3),
-                    (240, 450),
+                    "ERR:{:+.2f}  ACT:{:.3f}".format(centroid_error, actividad_norm),
+                    (10, 450),
                     cv2.FONT_HERSHEY_PLAIN,
                     1.5,
                     (255, 255, 255),
