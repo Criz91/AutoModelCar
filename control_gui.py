@@ -48,6 +48,7 @@ STATE_COLORS = {
     "TEST":    "#42a5f5",
     "AUTO":    "#ffb300",
     "LF":      "#26c6da",
+    "TPARK":   "#ff9800",
     "DONE":    "#43a047",
     "ABORT":   "#e53935",
     "?":       "#9e9e9e",
@@ -237,6 +238,14 @@ class CarControllerGUI:
                    ).pack(side="left", expand=True, fill="x", padx=2)
         ttk.Button(prow, text="Estacionar DERECHA", style="Big.TButton",
                    command=lambda: self.send("PR")
+                   ).pack(side="left", expand=True, fill="x", padx=2)
+
+        tprow = ttk.Frame(auto); tprow.pack(fill="x", pady=3)
+        ttk.Button(tprow, text="Test Park IZQ (ciego)",
+                   command=lambda: self.send("TPARKL")
+                   ).pack(side="left", expand=True, fill="x", padx=2)
+        ttk.Button(tprow, text="Test Park DER (ciego)",
+                   command=lambda: self.send("TPARKR")
                    ).pack(side="left", expand=True, fill="x", padx=2)
 
         lfrow = ttk.Frame(auto); lfrow.pack(fill="x", pady=3)

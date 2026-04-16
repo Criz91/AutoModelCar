@@ -96,7 +96,7 @@ struct Params {
 Params P;
 
 // MODOS
-enum Mode { MANUAL, AUTO_PARK, SENSOR_TEST, LINE_FOLLOW };
+enum Mode { MANUAL, AUTO_PARK, SENSOR_TEST, LINE_FOLLOW, TEST_PARK };
 volatile Mode mode = MANUAL;
 
 // ESTADOS DE ESTACIONADO
@@ -174,6 +174,20 @@ bool kickArmPending = false;
 int  lfLastSteerTarget = -1;  // -1 = sin objetivo previo, evita refire
 unsigned long lfStart = 0;
 
+// VARIABLES TEST PARK (prueba ciega sin ultrasonicos)
+// Paso 0: avanzar recto 1m
+// Paso 1: frenar y esperar a que el volante este quieto
+// Paso 2: girar volante a tope
+// Paso 3: esperar a que termine de girar
+// Paso 4: reversa con giro (tReversaGiroMs)
+// Paso 5: frenar y enderezar
+// Paso 6: esperar a que termine de enderezar
+// Paso 7: reversa recta (1 segundo)
+// Paso 8: frenar -> ESTACIONADO
+int  tpStep = 0;
+int  tpSide = +1;  // +1 derecha, -1 izquierda
+unsigned long tpStepStart = 0;
+
 // TELEMETRIA Y TIEMPOS
 unsigned long lastTelemetryMs = 0;
 const unsigned long TELEMETRY_INTERVAL_MS = 200;
@@ -205,6 +219,7 @@ String modeToString() {
     case AUTO_PARK:   return "AUTO";
     case SENSOR_TEST: return "TEST";
     case LINE_FOLLOW: return "LF";
+    case TEST_PARK:   return "TPARK";
   }
   return "?";
 }
@@ -747,6 +762,138 @@ void lineFollowLoop() {
   }
 }
 
+// TEST PARK - prueba ciega de la maniobra sin ultrasonicos
+// Ejecuta la secuencia completa con tiempos fijos para que puedas ver
+// fisicamente que hace cada paso. Manda "TPARKR" o "TPARKL" desde la GUI
+// o por serial. Cada paso se anuncia con publishLine().
+// Para cancelar, manda cualquier comando manual (W/S/X/A/D/ESTOP).
+void startTestPark(int side) {
+  if (mode == AUTO_PARK) {
+    publishLine("ERR,TPARK_BLOCKED_BY_AUTO_PARK");
+    return;
+  }
+  tpSide = side;
+  tpStep = 0;
+  tpStepStart = millis();
+  mode = TEST_PARK;
+  hazardMode = 2;
+  parkState = AVANCE_INICIAL;
+
+  steerCalibrateHome();
+  steerCenter();
+  armKickStart();
+
+  publishLine(String("INFO,TPARK_START,") + (side > 0 ? "RIGHT" : "LEFT"));
+  publishLine("INFO,TPARK_PASO_0,AVANCE_1M");
+}
+
+void testParkLoop() {
+  if (mode != TEST_PARK) return;
+
+  unsigned long elapsed = millis() - tpStepStart;
+
+  switch (tpStep) {
+    // Paso 0: avanzar recto durante el tiempo correspondiente a distInicialCm
+    case 0: {
+      driveForwardKick(P.parkDriveSpeed);
+      int tAvance = tAvanceInicialMsEff();
+      if (elapsed > (unsigned long)tAvance) {
+        driveStop();
+        tpStep = 1;
+        tpStepStart = millis();
+        publishLine("INFO,TPARK_PASO_1,FRENANDO");
+        parkState = AVANZAR_PASA_HUECO;
+      }
+      break;
+    }
+
+    // Paso 1: pausa breve de 500ms (simula encontrar hueco + avanzar un poco)
+    case 1: {
+      driveStop();
+      if (elapsed > 500) {
+        // Girar volante al lado correspondiente
+        if (tpSide > 0) steerFullRight();
+        else steerFullLeft();
+        tpStep = 2;
+        tpStepStart = millis();
+        publishLine("INFO,TPARK_PASO_2,GIRANDO_VOLANTE");
+        parkState = STOP_Y_GIRAR;
+      }
+      break;
+    }
+
+    // Paso 2: esperar a que el volante termine de girar
+    case 2: {
+      driveStop();
+      if (!steerBusy()) {
+        armKickStart();
+        tpStep = 3;
+        tpStepStart = millis();
+        publishLine("INFO,TPARK_PASO_3,REVERSA_CON_GIRO");
+        parkState = REVERSA_GIRO;
+      }
+      // Timeout: si el volante no termina en 2s, algo esta mal
+      if (elapsed > 2000) {
+        publishLine("WARN,TPARK_STEER_TIMEOUT");
+        armKickStart();
+        tpStep = 3;
+        tpStepStart = millis();
+        parkState = REVERSA_GIRO;
+      }
+      break;
+    }
+
+    // Paso 3: reversa con volante girado durante tReversaGiroMs
+    case 3: {
+      driveReverseKick(P.parkDriveSpeed);
+      if (elapsed > (unsigned long)P.tReversaGiroMs) {
+        driveStop();
+        steerCenter();
+        tpStep = 4;
+        tpStepStart = millis();
+        publishLine("INFO,TPARK_PASO_4,ENDEREZANDO");
+        parkState = STOP_Y_ENDEREZAR;
+      }
+      break;
+    }
+
+    // Paso 4: esperar a que el volante se enderece
+    case 4: {
+      driveStop();
+      if (!steerBusy()) {
+        armKickStart();
+        tpStep = 5;
+        tpStepStart = millis();
+        publishLine("INFO,TPARK_PASO_5,REVERSA_RECTA");
+        parkState = REVERSA_RECTA;
+      }
+      if (elapsed > 2000) {
+        publishLine("WARN,TPARK_CENTER_TIMEOUT");
+        armKickStart();
+        tpStep = 5;
+        tpStepStart = millis();
+        parkState = REVERSA_RECTA;
+      }
+      break;
+    }
+
+    // Paso 5: reversa recta por 1 segundo
+    case 5: {
+      driveReverseKick((int)(P.parkDriveSpeed * 0.7));
+      if (elapsed > 1000) {
+        driveStop();
+        tpStep = 6;
+        tpStepStart = millis();
+        publishLine("INFO,TPARK_PASO_6,FIN");
+        parkState = ESTACIONADO;
+        finishParking();
+        mode = MANUAL;  // finishParking ya hace esto, pero por claridad
+      }
+      break;
+    }
+  }
+}
+
 // PARAMETROS POR COMANDO (SET:clave=valor)
 void applyParam(const String& k, int v) {
   if      (k=="driveSpeed")        P.driveSpeed        = constrain(v,0,255);
@@ -786,6 +933,7 @@ void applyParam(const String& k, int v) {
 //   W S X A D C            - movimiento manual
 //   PR PL                  - estacionar derecha / izquierda
 //   LF NOLF                - entrar / salir de line follow
+//   TPARKR TPARKL           - prueba ciega de estacionamiento
 //   T H CAL ESTOP          - test sensores, hazards, calibrar, paro
 //   SET:clave=valor        - ajustar parametro en vivo
 //   PING                   - heartbeat (responde PONG)
@@ -814,9 +962,15 @@ void handleCommand(String cmd, const String& sourceName) {
     return;
   }
 
-  // Cualquier comando manual durante AUTO_PARK lo cancela
+  // Cualquier comando manual durante AUTO_PARK o TEST_PARK lo cancela
   if (mode == AUTO_PARK && cmd != "PR" && cmd != "PL") {
     abortParking("manual_override");
+  }
+  if (mode == TEST_PARK && cmd != "TPARKR" && cmd != "TPARKL") {
+    publishLine("INFO,TPARK_CANCELLED");
+    fullStop();
+    mode = MANUAL;
+    parkState = ABORTADO;
   }
 
   // Cualquier comando manual de movimiento durante LF tambien lo cancela
@@ -827,8 +981,10 @@ void handleCommand(String cmd, const String& sourceName) {
     stopLineFollow("manual_override");
   }
 
-  if      (cmd == "PR")    { if (mode == MANUAL) startParking(+1); }
-  else if (cmd == "PL")    { if (mode == MANUAL) startParking(-1); }
+  if      (cmd == "PR")     { if (mode == MANUAL) startParking(+1); }
+  else if (cmd == "PL")     { if (mode == MANUAL) startParking(-1); }
+  else if (cmd == "TPARKR") { startTestPark(+1); }
+  else if (cmd == "TPARKL") { startTestPark(-1); }
   else if (cmd == "LF")    { startLineFollow(); }
   else if (cmd == "NOLF")  { if (mode == LINE_FOLLOW) stopLineFollow("nolf_cmd"); }
   else if (cmd == "T")     { mode = (mode == SENSOR_TEST) ? MANUAL : SENSOR_TEST; publishLine("INFO,MODE," + modeToString()); }
@@ -929,6 +1085,7 @@ void readUARTCommands() {
 void handleGlobalTimeout() {
   if (mode == AUTO_PARK)   return;
   if (mode == LINE_FOLLOW) return;
+  if (mode == TEST_PARK)   return;
 
   unsigned long now = millis();
   if (now - lastAnyCmdMs > GLOBAL_CMD_TIMEOUT_MS) {
@@ -1013,6 +1170,7 @@ void loop() {
 
   parkingLoop();
   lineFollowLoop();
+  testParkLoop();
   handleGlobalTimeout();
 
   if (millis() - lastTelemetryMs >= TELEMETRY_INTERVAL_MS) {
