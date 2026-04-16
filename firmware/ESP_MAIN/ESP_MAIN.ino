@@ -41,7 +41,9 @@ const int TRIG_R = 4,  ECHO_R = 5;   // derecho
 const int TRIG_L = 6,  ECHO_L = 7;   // izquierdo
 const int TRIG_B = 15, ECHO_B = 9;   // trasero
 const int TRIG_F = 1,  ECHO_F = 2;   // frontal (NUEVO)
-
+// NOTA: GPIO1 y GPIO2 en ESP32-S3 son GPIO normales (no son UART0 como en
+// el ESP32 clasico). Si tu placa concreta los expone como strapping pins,
+// reasigna TRIG_F y ECHO_F a otros pines antes de soldar.
 
 // Seguidores de linea TCRT5000 (digitales, salida del comparador)
 const int LINE_L = 38;   // izquierda
@@ -295,7 +297,7 @@ void steerUpdate() {
 
   unsigned long el = millis() - steerMoveStart;
   if (el >= (unsigned long)steerMoveDur) {
-    steerPosMs = constrain(steerPosMs + steerMoveDir * (int)el, 0, P.tSteerFullMs);
+    steerPosMs = constrain(steerPosMs + steerMoveDir * steerMoveDur, 0, P.tSteerFullMs);
     setMotor(IN1, IN2, CH_STEER, 0);
     steerMoveDir = 0;
   }
