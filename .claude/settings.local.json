@@ -10,7 +10,8 @@
       "Bash(python -c ':*)",
       "Bash(ls rpi:*)",
       "Bash(mkdir rpi:*)",
-      "Bash(python -c \"import ast; ast.parse\\(open\\('rpi/master_autonomo_hailo.py',encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")"
+      "Bash(python -c \"import ast; ast.parse\\(open\\('rpi/master_autonomo_hailo.py',encoding='utf-8'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('rpi/master_autonomo_hailo.py',encoding='utf-8'\\).read\\(\\)\\); print\\('Pi OK'\\)\")"
     ]
   }
 }
