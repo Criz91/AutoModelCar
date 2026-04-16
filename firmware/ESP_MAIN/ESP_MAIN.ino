@@ -63,7 +63,7 @@ const int CH_DRIVE = 1;
 
 // PARAMETROS AJUSTABLES (sliders del GUI)
 struct Params {
-  int driveSpeed         = 180;
+  int driveSpeed         = 200;
   int parkDriveSpeed     = 200;
   int steerSpeed         = 170;
   int tSteerFullMs       = 400;

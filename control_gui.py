@@ -17,7 +17,7 @@ DEFAULT_PORT = 8080
 # mover el slider se manda "SET:clave=valor" por TCP y el ESP32 ajusta
 # el parametro en vivo sin reflashear.
 SLIDERS = [
-    ("driveSpeed",       "Velocidad manual (PWM)",        0,    255,  180),
+    ("driveSpeed",       "Velocidad manual (PWM)",        0,    255,  200),
     ("parkDriveSpeed",   "Velocidad estacionar (PWM)",    0,    255,  200),
     ("lineFollowSpeed",  "Velocidad line follow (PWM)",   0,    255,  150),
     ("steerSpeed",       "Velocidad direccion (PWM)",     0,    255,  170),

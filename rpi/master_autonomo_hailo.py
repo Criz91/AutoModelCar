@@ -24,29 +24,49 @@ Logica de handoff Hailo <-> Line Follow:
 
 El servidor FastAPI en puerto 5000 expone un MJPEG con visualizacion de
 zonas y comando actual, util para debug remoto desde la laptop por WiFi.
+
+Uso:
+    python3 master_autonomo_hailo.py           # modo normal
+    python3 master_autonomo_hailo.py --test    # prueba UART y camara sin Hailo
 """
 
-import cv2
-import glob
-import numpy as np
-import signal
+import os
 import sys
+import signal
 import threading
 import time
+import traceback
 
-import serial
-import uvicorn
-from fastapi import FastAPI
-from starlette.responses import StreamingResponse
+# Verificar dependencias antes de importar para dar mensajes claros
+_FALTAN = []
+try:
+    import cv2
+except ImportError:
+    _FALTAN.append("opencv-python (sudo apt install python3-opencv)")
 
-from picamera2 import Picamera2
-from hailo_platform import (
-    HEF,
-    VDevice,
-    InputVStreamParams,
-    OutputVStreamParams,
-    InferVStreams,
-)
+try:
+    import numpy as np
+except ImportError:
+    _FALTAN.append("numpy (pip install numpy)")
+
+try:
+    import serial
+except ImportError:
+    _FALTAN.append("pyserial (sudo apt install python3-serial)")
+
+try:
+    import uvicorn
+    from fastapi import FastAPI
+    from starlette.responses import StreamingResponse
+except ImportError:
+    _FALTAN.append("fastapi + uvicorn (pip install fastapi uvicorn)")
+
+if _FALTAN:
+    print("ERROR: faltan dependencias para correr el cerebro:")
+    for d in _FALTAN:
+        print("  -", d)
+    print("Instala todo y vuelve a correr.")
+    sys.exit(1)
 
 
 # Configuracion principal
@@ -72,7 +92,8 @@ class CarroCerebro:
         self.stop_event = threading.Event()
         self.ultimo_comando = ""
         self.modo_LF = False
-        self.telemetria_esp = ""  # ultima linea JSON recibida del ESP
+        self.telemetria_esp = ""
+        self.error_fatal = None   # si un hilo truena, guarda el mensaje
 
 
 cerebro = CarroCerebro()
@@ -83,36 +104,35 @@ def abrir_uart():
     for puerto in PUERTOS_UART_CANDIDATOS:
         try:
             s = serial.Serial(puerto, BAUD_RATE, timeout=0.05)
-            print("UART abierto en", puerto)
+            print("[OK] UART abierto en", puerto)
             return s
         except Exception as e:
-            print("UART", puerto, "no disponible:", e)
-    print("ADVERTENCIA: no se pudo abrir ningun UART. El carro NO se movera.")
+            print("[--] UART", puerto, "no disponible:", e)
+    print("[ERROR] No se pudo abrir ningun puerto UART.")
+    print("        Verifica que el puerto serie este habilitado en raspi-config")
+    print("        y que el cable UART Pi<->ESP este conectado.")
     return None
 
 
-esp32 = abrir_uart()
-
-
-def enviar_comando(cmd):
+def enviar_comando(cmd, uart):
     """Envia un comando al ESP si el puerto esta disponible."""
-    if esp32 is None:
+    if uart is None:
         return
     try:
-        esp32.write((cmd + "\n").encode("ascii"))
-        esp32.flush()
+        uart.write((cmd + "\n").encode("ascii"))
+        uart.flush()
     except Exception as e:
-        print("Error enviando", cmd, ":", e)
+        print("[ERROR] Enviando", cmd, ":", e)
 
 
-def loop_lectura_telemetria():
+def loop_lectura_telemetria(uart):
     """Hilo que escucha lineas del ESP y guarda la ultima telemetria."""
-    if esp32 is None:
+    if uart is None:
         return
     buf = ""
     while not cerebro.stop_event.is_set():
         try:
-            data = esp32.read(128)
+            data = uart.read(128)
             if not data:
                 continue
             buf += data.decode("ascii", errors="ignore")
@@ -125,19 +145,71 @@ def loop_lectura_telemetria():
             time.sleep(0.05)
 
 
-def loop_inteligencia():
+def loop_inteligencia(uart):
     """Hilo principal: captura, infiere, decide y publica visualizacion."""
+    try:
+        _loop_inteligencia_inner(uart)
+    except Exception as e:
+        msg = "HILO DE IA MURIO: " + str(e)
+        print("[ERROR]", msg)
+        traceback.print_exc()
+        cerebro.error_fatal = msg
+        # Seguridad: parar motores si la IA truena
+        enviar_comando("X", uart)
+        enviar_comando("NOLF", uart)
+
+
+def _loop_inteligencia_inner(uart):
+    """Logica real del hilo de IA, separada para manejar excepciones arriba."""
+
+    # Importar picamera2 y hailo aqui para que el error sea claro
+    try:
+        from picamera2 import Picamera2
+    except ImportError:
+        raise RuntimeError(
+            "No se pudo importar picamera2. "
+            "Instala con: sudo apt install python3-picamera2"
+        )
+
+    try:
+        from hailo_platform import (
+            HEF,
+            VDevice,
+            InputVStreamParams,
+            OutputVStreamParams,
+            InferVStreams,
+        )
+    except ImportError:
+        raise RuntimeError(
+            "No se pudo importar hailo_platform. "
+            "Instala el SDK de Hailo segun la documentacion oficial."
+        )
+
+    # Buscar el modelo HEF
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    modelo_path = os.path.join(script_dir, MODELO_LANE)
+    if not os.path.exists(modelo_path):
+        raise RuntimeError(
+            "No se encontro el modelo '{}'. "
+            "Coloca el archivo lane.hef en la misma carpeta que este script ({}).".format(
+                MODELO_LANE, script_dir
+            )
+        )
 
     # Camara
+    print("[..] Iniciando picamera2...")
     picam2 = Picamera2()
     picam2.configure(picam2.create_preview_configuration({"size": (640, 480)}))
     picam2.start()
+    print("[OK] Camara lista.")
 
     # Hailo
+    print("[..] Cargando modelo Hailo:", modelo_path)
     target = VDevice()
-    hef = HEF(MODELO_LANE)
+    hef = HEF(modelo_path)
     network_group = target.configure(hef)[0]
     input_name = hef.get_input_vstream_infos()[0].name
+    print("[OK] Hailo listo. Input:", input_name)
 
     contador_cuadros = 0
     blackout_cnt = 0
@@ -149,7 +221,7 @@ def loop_inteligencia():
             OutputVStreamParams.make(network_group),
         ]
         with InferVStreams(network_group, *params) as pipe:
-            print("Cerebro activo. Analizando carril a", IMG_SIZE, "x", IMG_SIZE)
+            print("[OK] Cerebro activo. Analizando carril a", IMG_SIZE, "x", IMG_SIZE)
 
             while not cerebro.stop_event.is_set():
                 # Captura y pre-procesado
@@ -181,24 +253,26 @@ def loop_inteligencia():
                 z5 = np.sum(mask[:, seccion * 4:]) / factor
                 actividad_total = z1 + z2 + z3 + z4 + z5
 
-                # Deteccion de blackout / recovery (siempre)
+                # Deteccion de blackout / recovery
                 if actividad_total < UMBRAL_ACTIVIDAD:
                     blackout_cnt += 1
                     recover_cnt = 0
                     if blackout_cnt >= BLACKOUT_FRAMES and not cerebro.modo_LF:
-                        enviar_comando("LF")
+                        enviar_comando("LF", uart)
                         cerebro.modo_LF = True
                         cerebro.ultimo_comando = "LF"
+                        print("[LF] Blackout detectado, entrando a line-follow")
                 else:
                     blackout_cnt = 0
                     if cerebro.modo_LF:
                         if actividad_total > UMBRAL_ACTIVIDAD * HISTERESIS:
                             recover_cnt += 1
                             if recover_cnt >= RECOVER_FRAMES:
-                                enviar_comando("NOLF")
+                                enviar_comando("NOLF", uart)
                                 cerebro.modo_LF = False
                                 cerebro.ultimo_comando = ""
                                 recover_cnt = 0
+                                print("[LF] Carril recuperado, volviendo a Hailo")
                         else:
                             recover_cnt = 0
 
@@ -216,7 +290,7 @@ def loop_inteligencia():
                         comando_decidido = "X"
 
                     if comando_decidido != cerebro.ultimo_comando:
-                        enviar_comando(comando_decidido)
+                        enviar_comando(comando_decidido, uart)
                         cerebro.ultimo_comando = comando_decidido
 
                     contador_cuadros = 0
@@ -261,6 +335,74 @@ def loop_inteligencia():
     picam2.stop()
 
 
+def test_uart_y_camara():
+    """Modo de prueba: verifica UART y camara sin necesitar Hailo."""
+    print("=== MODO DE PRUEBA ===")
+    print()
+
+    # 1. UART
+    uart = abrir_uart()
+    if uart is None:
+        print("UART: FALLO. Verifica raspi-config y el cableado.")
+    else:
+        print("UART: OK. Mandando PING al ESP...")
+        enviar_comando("PING", uart)
+        time.sleep(0.5)
+        respuesta = ""
+        while uart.in_waiting:
+            respuesta += uart.read(uart.in_waiting).decode("ascii", errors="ignore")
+        if "PONG" in respuesta:
+            print("UART: El ESP respondio PONG. Comunicacion OK.")
+        else:
+            print("UART: No llego PONG. Respuesta:", repr(respuesta))
+            print("       Verifica que el ESP tenga el firmware cargado")
+            print("       y que TX de la Pi va a RX del ESP (y viceversa).")
+        print()
+
+        # Probar mover el carro brevemente
+        print("UART: Mandando W durante 0.5 s para probar traccion...")
+        enviar_comando("W", uart)
+        time.sleep(0.5)
+        enviar_comando("X", uart)
+        print("UART: Si el carro avanzo y freno, la traccion funciona.")
+        print()
+
+    # 2. Camara
+    try:
+        from picamera2 import Picamera2
+        print("Picamera2: importado OK.")
+        picam2 = Picamera2()
+        picam2.configure(picam2.create_preview_configuration({"size": (640, 480)}))
+        picam2.start()
+        frame = picam2.capture_array()
+        print("Picamera2: captura OK. Shape:", frame.shape)
+        picam2.stop()
+    except ImportError:
+        print("Picamera2: NO INSTALADO. sudo apt install python3-picamera2")
+    except Exception as e:
+        print("Picamera2: ERROR:", e)
+    print()
+
+    # 3. Hailo
+    try:
+        from hailo_platform import HEF
+        print("Hailo: importado OK.")
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        modelo_path = os.path.join(script_dir, MODELO_LANE)
+        if os.path.exists(modelo_path):
+            print("Hailo: modelo", MODELO_LANE, "encontrado.")
+        else:
+            print("Hailo: FALTA el modelo", MODELO_LANE)
+            print("       Coloca lane.hef en:", script_dir)
+    except ImportError:
+        print("Hailo: NO INSTALADO. Instala el SDK oficial de Hailo.")
+    print()
+
+    print("=== FIN DE PRUEBA ===")
+    if uart:
+        uart.close()
+
+
 # Servidor FastAPI - monitoreo remoto del video por WiFi
 app = FastAPI()
 
@@ -285,28 +427,79 @@ def video_feed():
 
 @app.get("/telemetria")
 def telemetria():
-    return {"esp": cerebro.telemetria_esp, "modo_LF": cerebro.modo_LF}
+    return {
+        "esp": cerebro.telemetria_esp,
+        "modo_LF": cerebro.modo_LF,
+        "error": cerebro.error_fatal,
+    }
+
+
+@app.get("/status")
+def status():
+    """Endpoint rapido para verificar que el script esta vivo."""
+    return {
+        "vivo": True,
+        "ultimo_comando": cerebro.ultimo_comando,
+        "modo_LF": cerebro.modo_LF,
+        "error": cerebro.error_fatal,
+    }
 
 
 def shutdown(signum, frame):
     """Stop graceful: detener motores y salir de LF antes de cerrar."""
     print("Deteniendo cerebro...")
     cerebro.stop_event.set()
-    enviar_comando("X")
-    enviar_comando("NOLF")
+    if _uart_global is not None:
+        enviar_comando("X", _uart_global)
+        enviar_comando("NOLF", _uart_global)
     time.sleep(0.2)
     sys.exit(0)
 
 
+_uart_global = None
+
+
 if __name__ == "__main__":
+    # Modo test: verifica hardware sin Hailo
+    if len(sys.argv) > 1 and sys.argv[1] == "--test":
+        test_uart_y_camara()
+        sys.exit(0)
+
+    print("AutoModelCar - Cerebro autonomo TMR 2026")
+    print()
+
+    # Abrir UART
+    _uart_global = abrir_uart()
+    if _uart_global is None:
+        print("Sin UART el carro no se va a mover.")
+        print("Si solo quieres probar el video, continuo de todas formas...")
+        print()
+
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
-    t_ia = threading.Thread(target=loop_inteligencia, daemon=True)
+    t_ia = threading.Thread(target=loop_inteligencia, args=(_uart_global,), daemon=True)
     t_ia.start()
 
-    t_tel = threading.Thread(target=loop_lectura_telemetria, daemon=True)
+    t_tel = threading.Thread(target=loop_lectura_telemetria, args=(_uart_global,), daemon=True)
     t_tel.start()
 
+    # Esperar un poco a que el hilo de IA arranque o falle
+    time.sleep(3)
+    if cerebro.error_fatal:
+        print()
+        print("El hilo de IA no pudo arrancar:")
+        print(" ", cerebro.error_fatal)
+        print()
+        print("Corrige el error y vuelve a correr.")
+        print("Tip: usa 'python3 master_autonomo_hailo.py --test'")
+        print("     para diagnosticar pieza por pieza.")
+        sys.exit(1)
+
+    print()
     print("Monitor web activo en http://[IP_DE_LA_PI]:5000")
+    print("  /          -> video MJPEG")
+    print("  /status    -> estado del cerebro")
+    print("  /telemetria -> ultima telemetria del ESP")
+    print()
     uvicorn.run(app, host="0.0.0.0", port=5000, log_level="error")
