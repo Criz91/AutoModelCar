@@ -487,10 +487,84 @@ def shutdown(signum, frame):
 _uart_global = None
 
 
+def test_drive():
+    """Modo --test-drive: manda una secuencia de comandos por UART sin
+    necesitar Hailo, camara ni seguidores de linea. Solo prueba que la
+    comunicacion Pi -> UART -> ESP funciona y que el carro se mueve.
+
+    Uso: python3 master_autonomo_hailo.py --test-drive
+
+    Mientras corre, mira el log de la GUI: deben aparecer lineas
+    RX,UART,W / RX,UART,A / etc. Si no aparecen, el UART no esta
+    conectado o los cables TX/RX estan invertidos.
+    """
+    print("=== TEST DRIVE (sin IA, sin camara, sin seguidores) ===")
+    print()
+    uart = abrir_uart()
+    if uart is None:
+        print("No se pudo abrir UART. No se puede probar.")
+        sys.exit(1)
+
+    print("Mandando PING al ESP...")
+    enviar_comando("PING", uart)
+    time.sleep(0.5)
+    respuesta = ""
+    while uart.in_waiting:
+        respuesta += uart.read(uart.in_waiting).decode("ascii", errors="ignore")
+    if "PONG" in respuesta:
+        print("[OK] ESP respondio PONG. UART funciona.")
+    else:
+        print("[!!] No llego PONG. Respuesta:", repr(respuesta))
+        print("     Verifica cables y que el ESP tenga firmware cargado.")
+        print("     Continuo con la prueba de todas formas...")
+    print()
+
+    pasos = [
+        ("W",  1.5, "Avanzar recto 1.5 seg"),
+        ("X",  0.5, "Frenar"),
+        ("A",  0.4, "Girar izquierda 0.4 seg"),
+        ("C",  0.3, "Centrar direccion"),
+        ("W",  1.0, "Avanzar 1 seg"),
+        ("X",  0.5, "Frenar"),
+        ("D",  0.4, "Girar derecha 0.4 seg"),
+        ("C",  0.3, "Centrar direccion"),
+        ("S",  1.0, "Reversa 1 seg"),
+        ("X",  0.5, "Frenar"),
+    ]
+
+    print("Secuencia de prueba ({} pasos):".format(len(pasos)))
+    for cmd, dur, desc in pasos:
+        print("  {} -> {} ({:.1f}s)".format(cmd, desc, dur))
+    print()
+
+    input("Presiona ENTER para empezar (el carro se va a mover)...")
+    print()
+
+    for i, (cmd, dur, desc) in enumerate(pasos):
+        print("[{}/{}] {} -> {}".format(i + 1, len(pasos), cmd, desc))
+        enviar_comando(cmd, uart)
+        time.sleep(dur)
+
+    enviar_comando("X", uart)
+    print()
+    print("[OK] Secuencia terminada.")
+    print("     Si el carro se movio, la comunicacion Pi->ESP funciona.")
+    print("     Si no se movio, revisa:")
+    print("       - Que GPIO14(TX) de la Pi va a GPIO16(RX) del ESP")
+    print("       - Que GPIO15(RX) de la Pi va a GPIO17(TX) del ESP")
+    print("       - Que comparten GND")
+    uart.close()
+
+
 if __name__ == "__main__":
     # Modo test: verifica hardware sin Hailo
     if len(sys.argv) > 1 and sys.argv[1] == "--test":
         test_uart_y_camara()
+        sys.exit(0)
+
+    # Modo test-drive: prueba UART mandando W/A/D/S sin IA
+    if len(sys.argv) > 1 and sys.argv[1] == "--test-drive":
+        test_drive()
         sys.exit(0)
 
     print("AutoModelCar - Cerebro autonomo TMR 2026")
