@@ -13,6 +13,7 @@ import signal
 import threading
 import time
 import traceback
+from queue import Queue, Empty
 
 # Verificar dependencias antes de importar para dar mensajes claros
 _FALTAN = []
@@ -53,17 +54,14 @@ MODELO_LANE = "lane.hef"
 MODELO_DETECT = "detect-supremo.hef"
 
 BAUD_RATE = 115200
-PUERTOS_UART_CANDIDATOS = ["/dev/serial0", "/dev/ttyAMA0", "/dev/ttyS0"]
+PUERTO_UART = "/dev/ttyAMA0"
 
 IMG_SIZE = 640  # tamano de entrada de la red lane
 
 # ---------------- Velocidades ----------------
-# Recta, curva suave y curva fuerte
 VELOCIDAD_AUTONOMA_RECTA = 180
 VELOCIDAD_AUTONOMA_CURVA = 150
 VELOCIDAD_AUTONOMA_CURVA_FUERTE = 140
-
-# Velocidad usada cuando se detecta un stop y se va aproximando
 VELOCIDAD_APROX = 140
 
 # ---------------- Decisiones de carril ----------------
@@ -73,12 +71,10 @@ PESOS_FILAS = [0.1, 0.3, 0.6, 1.0]
 
 UMBRAL_ACTIVIDAD = 0.05
 
-# Umbrales de error
 UMBRAL_ERROR_RECTA = 0.16
 UMBRAL_ERROR_CURVA = 0.30
 UMBRAL_ERROR_CURVA_FUERTE = 0.48
 
-# Suavizado del cambio de estado
 CONFIRMACIONES_CAMBIO = 1
 
 BLACKOUT_FRAMES = 5
@@ -86,13 +82,8 @@ RECOVER_FRAMES = 4
 HISTERESIS = 1.5
 
 # ---------------- Keep-alive y direccion por pulsos ----------------
-# El ESP32 corta por timeout si no recibe comandos. Se manda W periodicamente.
 PERIODO_KEEPALIVE_W_S = 0.30
-
-# Cada cuanto tiempo se puede volver a mandar un pulso de direccion
 PERIODO_PULSO_DIRECCION_S = 0.14
-
-# Cuanto dura el pulso A/D antes de mandar C
 DURACION_PULSO_DIRECCION_S = 0.06
 
 # ---------------- Deteccion de senales ----------------
@@ -118,7 +109,10 @@ class CarroCerebro:
         self.frame_web = None
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
+
+        # UART
         self.uart_write_lock = threading.Lock()
+        self.uart_queue = Queue()
 
         self.ultimo_comando = ""
         self.modo_LF = False
@@ -133,7 +127,7 @@ class CarroCerebro:
         self.stop_state = "normal"      # normal | aproximando | detenido | cooldown
         self.stop_state_since = 0.0
 
-        # Control autonomo mas robusto
+        # Control autonomo
         self.ultimo_drive_cmd = ""
         self.ultimo_steer_cmd = ""
         self.ultima_velocidad_enviada = None
@@ -146,6 +140,9 @@ class CarroCerebro:
         self.velocidad_actual_objetivo = VELOCIDAD_AUTONOMA_RECTA
         self.direccion_objetivo = "C"   # A / D / C
 
+        # Evitar spam de freno/centrado
+        self.control_detenido = False
+
 
 cerebro = CarroCerebro()
 
@@ -154,35 +151,64 @@ cerebro = CarroCerebro()
 # UART
 # ============================================================
 def abrir_uart():
-    """Intenta abrir el puerto UART en los candidatos comunes de la Pi 5."""
-    for puerto in PUERTOS_UART_CANDIDATOS:
+    """Abre el puerto UART real verificado en la Raspberry."""
+    try:
+        s = serial.Serial(
+            port=PUERTO_UART,
+            baudrate=BAUD_RATE,
+            timeout=0.05,
+            write_timeout=0.2
+        )
+        time.sleep(0.2)
+
         try:
-            s = serial.Serial(puerto, BAUD_RATE, timeout=0.05)
-            print("[OK] UART abierto en", puerto)
-            return s
-        except Exception as e:
-            print("[--] UART", puerto, "no disponible:", e)
+            s.reset_input_buffer()
+            s.reset_output_buffer()
+        except Exception:
+            pass
 
-    print("[ERROR] No se pudo abrir ningun puerto UART.")
-    print("        Verifica que el puerto serie este habilitado en raspi-config")
-    print("        y que el cable UART Pi<->ESP este conectado.")
-    return None
+        print("[OK] UART abierto en", PUERTO_UART)
+        return s
+    except Exception as e:
+        print("[ERROR] No se pudo abrir UART en", PUERTO_UART, ":", e)
+        print("        Verifica que el puerto exista, que no este ocupado")
+        print("        y que el cableado Pi<->ESP sea correcto.")
+        return None
 
 
-def enviar_comando(cmd, uart):
-    """Envia un comando ASCII terminado en \\n al ESP32."""
+def encolar_comando(cmd):
+    """Encola un comando ASCII para que solo un hilo lo escriba."""
+    if not cmd:
+        return
+    cerebro.uart_queue.put(cmd)
+
+
+def enviar_comando(cmd, uart=None):
+    """Compatibilidad con el codigo existente: ahora solo encola."""
+    encolar_comando(cmd)
+
+
+def loop_uart_writer(uart):
+    """Unico hilo que escribe al UART."""
     if uart is None:
         return
-    try:
-        with cerebro.uart_write_lock:
-            uart.write((cmd + "\n").encode("ascii"))
-            uart.flush()
-    except Exception as e:
-        print("[ERROR] Enviando", cmd, ":", e)
+
+    while not cerebro.stop_event.is_set():
+        try:
+            cmd = cerebro.uart_queue.get(timeout=0.1)
+        except Empty:
+            continue
+
+        try:
+            with cerebro.uart_write_lock:
+                uart.write((cmd + "\n").encode("ascii"))
+                uart.flush()
+        except Exception as e:
+            print("[ERROR] Enviando", cmd, ":", e)
 
 
 def loop_lectura_telemetria(uart):
-    """Hilo que escucha lineas del ESP y guarda la ultima telemetria JSON."""
+    """Hilo que escucha lineas del ESP y guarda la ultima telemetria."""
     if uart is None:
         return
 
@@ -194,13 +220,53 @@ def loop_lectura_telemetria(uart):
                 continue
 
             buf += data.decode("ascii", errors="ignore")
+
             while "\n" in buf:
                 linea, buf = buf.split("\n", 1)
                 linea = linea.strip()
-                if linea.startswith("{"):
-                    cerebro.telemetria_esp = linea
-        except Exception:
+                if not linea:
+                    continue
+
+                cerebro.telemetria_esp = linea
+                print("[ESP]", linea)
+
+        except Exception as e:
+            print("[ERROR] Leyendo telemetria:", e)
             time.sleep(0.05)
+
+
+def probar_ping(uart, timeout=1.5):
+    """Handshake simple para verificar que el ESP responde."""
+    if uart is None:
+        return False
+
+    try:
+        uart.reset_input_buffer()
+    except Exception:
+        pass
+
+    encolar_comando("PING")
+
+    fin = time.time() + timeout
+    buf = ""
+
+    while time.time() < fin:
+        try:
+            data = uart.read(128)
+            if data:
+                buf += data.decode("ascii", errors="ignore")
+                while "\n" in buf:
+                    linea, buf = buf.split("\n", 1)
+                    linea = linea.strip()
+                    if linea:
+                        print("[ESP]", linea)
+                    if "PONG" in linea:
+                        cerebro.telemetria_esp = linea
+                        return True
+        except Exception:
+            break
+
+    return False
 
 
 # ============================================================
@@ -481,10 +547,13 @@ def mantener_traccion(uart):
 
 
 def detener_control_autonomo(uart, reason=""):
-    """Frena y centra al salir de autonomia."""
+    """Frena y centra al salir de autonomia, pero solo una vez."""
     cerebro.autonomia_activa = False
     cerebro.direccion_objetivo = "C"
     cerebro.steer_pulse_until = 0.0
+
+    if cerebro.control_detenido:
+        return
 
     enviar_comando("C", uart)
     enviar_comando("X", uart)
@@ -492,6 +561,7 @@ def detener_control_autonomo(uart, reason=""):
     cerebro.ultimo_drive_cmd = "X"
     cerebro.ultimo_steer_cmd = "C"
     cerebro.ultimo_comando = "X"
+    cerebro.control_detenido = True
 
     if reason:
         print("[AUTO] Control autonomo detenido:", reason)
@@ -697,6 +767,7 @@ def _loop_inteligencia_inner(uart):
                 # CONTROL AUTONOMO REAL
                 # --------------------------------------------------
                 if not cerebro.modo_LF and not cerebro.parada_activa:
+                    cerebro.control_detenido = False
                     error_abs = abs(centroid_error)
 
                     if centroid_error < -UMBRAL_ERROR_CURVA_FUERTE:
@@ -721,7 +792,6 @@ def _loop_inteligencia_inner(uart):
                         nuevo_cmd = "C"
                         velocidad_obj = VELOCIDAD_AUTONOMA_RECTA
 
-                    # Suavizado
                     if nuevo_cmd == cmd_candidato_prev:
                         confirmaciones += 1
                     else:
@@ -734,11 +804,7 @@ def _loop_inteligencia_inner(uart):
                         cerebro.velocidad_actual_objetivo = velocidad_obj
 
                         set_velocidad_objetivo(velocidad_obj, uart)
-
-                        # Mantener avance SIEMPRE
                         mantener_traccion(uart)
-
-                        # Corregir direccion por pulsos
                         actualizar_direccion_objetivo(nuevo_cmd, uart)
 
                         if nuevo_cmd == "C":
@@ -815,24 +881,25 @@ def test_uart_y_camara():
         print("UART: FALLO. Verifica raspi-config y el cableado.")
     else:
         print("UART: OK. Mandando PING al ESP...")
-        enviar_comando("PING", uart)
-        time.sleep(0.5)
-        respuesta = ""
-        while uart.in_waiting:
-            respuesta += uart.read(uart.in_waiting).decode("ascii", errors="ignore")
+        ok = probar_ping(uart, timeout=2.0)
 
-        if "PONG" in respuesta:
+        if ok:
             print("UART: El ESP respondio PONG. Comunicacion OK.")
         else:
-            print("UART: No llego PONG. Respuesta:", repr(respuesta))
+            print("UART: No llego PONG.")
             print("       Verifica que el ESP tenga el firmware cargado")
             print("       y que TX de la Pi va a RX del ESP (y viceversa).")
         print()
 
         print("UART: Mandando W durante 0.5 s para probar traccion...")
-        enviar_comando("W", uart)
-        time.sleep(0.5)
-        enviar_comando("X", uart)
+        try:
+            uart.write(b"W\n")
+            uart.flush()
+            time.sleep(0.5)
+            uart.write(b"X\n")
+            uart.flush()
+        except Exception as e:
+            print("UART: Error en prueba W/X:", e)
         print("UART: Si el carro avanzo y freno, la traccion funciona.")
         print()
 
@@ -880,17 +947,12 @@ def test_drive():
         sys.exit(1)
 
     print("Mandando PING al ESP...")
-    enviar_comando("PING", uart)
-    time.sleep(0.5)
+    ok = probar_ping(uart, timeout=2.0)
 
-    respuesta = ""
-    while uart.in_waiting:
-        respuesta += uart.read(uart.in_waiting).decode("ascii", errors="ignore")
-
-    if "PONG" in respuesta:
+    if ok:
         print("[OK] ESP respondio PONG. UART funciona.")
     else:
-        print("[!!] No llego PONG. Respuesta:", repr(respuesta))
+        print("[!!] No llego PONG.")
         print("     Verifica cables y que el ESP tenga firmware cargado.")
         print("     Continuo con la prueba de todas formas...")
     print()
@@ -919,11 +981,20 @@ def test_drive():
 
     for i, (cmd, dur, desc) in enumerate(pasos):
         print("[{}/{}] {} -> {}".format(i + 1, len(pasos), cmd, desc))
-        enviar_comando(cmd, uart)
+        try:
+            uart.write((cmd + "\n").encode("ascii"))
+            uart.flush()
+        except Exception as e:
+            print("[ERROR] Enviando", cmd, ":", e)
         time.sleep(dur)
 
-    enviar_comando("X", uart)
-    enviar_comando("C", uart)
+    try:
+        uart.write(b"X\n")
+        uart.flush()
+        uart.write(b"C\n")
+        uart.flush()
+    except Exception:
+        pass
 
     print()
     print("[OK] Secuencia terminada.")
@@ -989,9 +1060,16 @@ def shutdown(signum, frame):
     print("Deteniendo cerebro...")
     cerebro.stop_event.set()
     if _uart_global is not None:
-        enviar_comando("C", _uart_global)
-        enviar_comando("X", _uart_global)
-        enviar_comando("NOLF", _uart_global)
+        try:
+            with cerebro.uart_write_lock:
+                _uart_global.write(b"C\n")
+                _uart_global.flush()
+                _uart_global.write(b"X\n")
+                _uart_global.flush()
+                _uart_global.write(b"NOLF\n")
+                _uart_global.flush()
+        except Exception:
+            pass
     time.sleep(0.2)
     sys.exit(0)
 
@@ -1019,9 +1097,19 @@ if __name__ == "__main__":
         print("Sin UART el carro no se va a mover.")
         print("Si solo quieres probar el video, continuo de todas formas...")
         print()
+    else:
+        if probar_ping(_uart_global):
+            print("[OK] Handshake UART correcto con ESP32")
+        else:
+            print("[WARN] No hubo PONG del ESP32")
+            print("       La UART abrio, pero no hay confirmacion real de comunicacion.")
+        print()
 
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
+
+    t_uart = threading.Thread(target=loop_uart_writer, args=(_uart_global,), daemon=True)
+    t_uart.start()
 
     t_ia = threading.Thread(target=loop_inteligencia, args=(_uart_global,), daemon=True)
     t_ia.start()
