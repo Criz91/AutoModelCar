@@ -1,21 +1,9 @@
 // AutoModelCar - Firmware unificado ESP32-S3
 // TMR 2026 - Categoria AutoModelCar
-// Tres canales de comunicacion conviven:
-//   - WiFi AP + TCP puerto 8080  -> GUI de la laptop (teleop, tuning, parking)
-//   - UART2 (RX=16, TX=17)       -> Raspberry Pi 5 con Hailo (IA carril)
-//   - Serial USB                 -> debug
-//
-// Modos:
-//   MANUAL       - control manual WASD desde GUI o desde Pi
-//   AUTO_PARK    - maquina de estados de estacionamiento en bateria
-//   LINE_FOLLOW  - sigue linea con TCRT5000, activado por la Pi cuando
-//                  Hailo pierde el carril en una curva cerrada
-//   SENSOR_TEST  - dump de sensores cada 500 ms para depuracion
 
 #include <WiFi.h>
 #include <ArduinoJson.h>
 
-// WIFI AP + TCP SERVER
 const char* AP_SSID = "AutoModelCar_TMR26";
 const char* AP_PASS = "tmr2026robot";
 
@@ -30,45 +18,29 @@ HardwareSerial PiSerial(2);
 String uartBuffer = "";
 
 // PINES DEL PUENTE H Y SENSORES
-// Direccion (motor delantero)
 const int IN1 = 12, IN2 = 11, ENA = 8;
-
-// Traccion (motor trasero)
 const int IN3 = 14, IN4 = 13, ENB = 18;
 
-// Ultrasonicos HC-SR04
-const int TRIG_R = 4,  ECHO_R = 5;   // derecho
-const int TRIG_L = 6,  ECHO_L = 7;   // izquierdo
-const int TRIG_B = 15, ECHO_B = 9;   // trasero
-const int TRIG_F = 1,  ECHO_F = 2;   // frontal (NUEVO)
-// NOTA: GPIO1 y GPIO2 en ESP32-S3 son GPIO normales (no son UART0 como en
-// el ESP32 clasico). Si tu placa concreta los expone como strapping pins,
-// reasigna TRIG_F y ECHO_F a otros pines antes de soldar.
+const int TRIG_R = 4,  ECHO_R = 5;
+const int TRIG_L = 6,  ECHO_L = 7;
+const int TRIG_B = 15, ECHO_B = 9;
+const int TRIG_F = 1,  ECHO_F = 2;
 
-// Seguidores de linea TCRT5000 (digitales, salida del comparador)
-const int LINE_L = 38;   // izquierda
-const int LINE_R = 39;   // derecha
-const int LINE_C = 40;   // centro
-// Polaridad: el modulo MDU-SEN-MH-TCRT5000 entrega LOW cuando ve superficie
-// reflectiva (linea blanca sobre piso negro). Si la pista
-// invierte la polaridad, cambiar LINE_ACTIVE_LOW a 0.
+const int LINE_L = 38;
+const int LINE_R = 39;
+const int LINE_C = 40;
 #define LINE_ACTIVE_LOW 1
 
-// LEDs (intermitentes / hazards)
 const int LED_L = 10, LED_R = 21;
 
-// LED de freno (stop light) - AVISO: ESP32-S3 soporta GPIO 0-48.
-// Si tu placa no expone GPIO 51 (o usa un expansor de I/O), cambia este valor
-// al GPIO fisico disponible en tu PCB (p.ej. 47 o 48).
-const int LED_STOP = 51;
+// Focos Rojos de freno
+const int LED_STOP = 41;
 
-// PWM
-const int PWM_FREQ = 20000;
+const int PWM_FREQ = 2000;
 const int PWM_RES  = 8;
 const int CH_STEER = 0;
 const int CH_DRIVE = 1;
 
-// PARAMETROS AJUSTABLES (sliders del GUI)
 struct Params {
   int driveSpeed         = 200;
   int parkDriveSpeed     = 200;
@@ -94,65 +66,36 @@ struct Params {
   int kickStartPWM       = 240;
   int kickStartMs        = 150;
   int tReversaGiroMs     = 1600;
-
-  // NUEVOS para LINE_FOLLOW
-  int lineFollowSpeed    = 150;  // PWM de traccion durante LF
+  int lineFollowSpeed    = 150;
 };
 Params P;
 
-// MODOS
 enum Mode { MANUAL, AUTO_PARK, SENSOR_TEST, LINE_FOLLOW, TEST_PARK };
 volatile Mode mode = MANUAL;
 
-// ESTADOS DE ESTACIONADO
-enum ParkState {
-  IDLE,
-  AVANCE_INICIAL,
-  MEDIR_HUECO,
-  AVANZAR_PASA_HUECO,
-  STOP_Y_GIRAR,
-  REVERSA_GIRO,
-  STOP_Y_ENDEREZAR,
-  REVERSA_RECTA,
-  ESTACIONADO,
-  ABORTADO
-};
-
+enum ParkState { IDLE, AVANCE_INICIAL, MEDIR_HUECO, AVANZAR_PASA_HUECO, STOP_Y_GIRAR, REVERSA_GIRO, STOP_Y_ENDEREZAR, REVERSA_RECTA, ESTACIONADO, ABORTADO };
 ParkState parkState = IDLE;
 unsigned long stateStart = 0;
 unsigned long autoStart  = 0;
+int parkSide = +1;
 
-int parkSide = +1;  // +1 derecha, -1 izquierda
-
-// ESTIMACION DE DIRECCION
 int steerPosMs   = 200;
 int steerMoveDir = 0;
 int steerMoveDur = 0;
 unsigned long steerMoveStart = 0;
 
-// HAZARDS
 volatile int hazardMode = 0;
 
-// FILTRO MEDIANA (5 muestras)
 struct MedianFilter {
   long buf[5] = {999,999,999,999,999};
   int idx = 0;
-
-  void push(long v) {
-    buf[idx] = v;
-    idx = (idx + 1) % 5;
-  }
-
+  void push(long v) { buf[idx] = v; idx = (idx + 1) % 5; }
   long get() {
     long s[5];
     for (int i = 0; i < 5; i++) s[i] = buf[i];
     for (int i = 0; i < 4; i++) {
       for (int j = i + 1; j < 5; j++) {
-        if (s[i] > s[j]) {
-          long t = s[i];
-          s[i] = s[j];
-          s[j] = t;
-        }
+        if (s[i] > s[j]) { long t = s[i]; s[i] = s[j]; s[j] = t; }
       }
     }
     return s[2];
@@ -161,45 +104,30 @@ struct MedianFilter {
 
 MedianFilter filtR, filtL, filtB, filtF;
 volatile long lastR = 999, lastL = 999, lastB = 999, lastF = 999;
-
-// Lecturas digitales de los seguidores de linea (1 = ve linea blanca)
 volatile int lnL = 0, lnR = 0, lnC = 0;
 
-// VARIABLES AUTO PARK
-int countCarro = 0;
-int countHueco = 0;
-unsigned long huecoT0 = 0;
-unsigned long huecoLastT = 0;
+int countCarro = 0, countHueco = 0;
+unsigned long huecoT0 = 0, huecoLastT = 0;
 int huecoLargoCm = 0;
 unsigned long kickStartT0 = 0;
-bool kickStartActive = false;
-bool kickArmPending = false;
+bool kickStartActive = false, kickArmPending = false;
 
-// VARIABLES LINE FOLLOW
-int  lfLastSteerTarget = -1;  // -1 = sin objetivo previo, evita refire
+int  lfLastSteerTarget = -1;
 unsigned long lfStart      = 0;
-unsigned long lfCruceStart = 0;  // 0=normal, >0=en espera de cruce peatonal
-unsigned long lfSlowUntil  = 0;  // frenar en curva hasta este timestamp
+unsigned long lfCruceStart = 0; 
+unsigned long lfSlowUntil  = 0; 
 
-// VARIABLES TEST PARK (prueba ciega sin ultrasonicos)
-int  tpStep = 0;
-int  tpSide = +1;
+int  tpStep = 0, tpSide = +1, tpBlinks = 0;
 unsigned long tpStepStart = 0;
-int  tpBlinks = 0;
 
-// TELEMETRIA Y TIEMPOS
 unsigned long lastTelemetryMs = 0;
 const unsigned long TELEMETRY_INTERVAL_MS = 200;
-
 unsigned long lastAnyCmdMs = 0;
 const unsigned long GLOBAL_CMD_TIMEOUT_MS = 1500;
 
-// UTILIDADES DE COMUNICACION
 void sendToAllTcpClients(const String& msg) {
   for (int i = 0; i < 4; i++) {
-    if (tcpClients[i] && tcpClients[i].connected()) {
-      tcpClients[i].println(msg);
-    }
+    if (tcpClients[i] && tcpClients[i].connected()) tcpClients[i].println(msg);
   }
 }
 
@@ -211,10 +139,7 @@ void publishLine(const String& msg) {
 
 String modeToString() {
   switch (mode) {
-    case MANUAL:
-      if (parkState == ESTACIONADO) return "DONE";
-      if (parkState == ABORTADO) return "ABORT";
-      return "MANUAL";
+    case MANUAL: if (parkState == ESTACIONADO) return "DONE"; if (parkState == ABORTADO) return "ABORT"; return "MANUAL";
     case AUTO_PARK:   return "AUTO";
     case SENSOR_TEST: return "TEST";
     case LINE_FOLLOW: return "LF";
@@ -244,48 +169,27 @@ void sendTelemetry() {
   j["t"]    = "tel";
   j["mode"] = modeToString();
   j["st"]   = parkStateToString();
-  j["R"]    = lastR;
-  j["L"]    = lastL;
-  j["B"]    = lastB;
-  j["F"]    = lastF;
-  j["lnL"]  = lnL;
-  j["lnR"]  = lnR;
-  j["lnC"]  = lnC;
-  j["sp"]   = steerPosMs;
-  j["side"] = parkSide;
+  j["R"]    = lastR; j["L"] = lastL; j["B"] = lastB; j["F"] = lastF;
+  j["lnL"]  = lnL; j["lnR"] = lnR; j["lnC"] = lnC;
+  j["sp"]   = steerPosMs; j["side"] = parkSide;
 
-  char buf[384];
-  size_t n = serializeJson(j, buf);
-
-  Serial.println(buf);
-  PiSerial.println(buf);
+  char buf[384]; size_t n = serializeJson(j, buf);
+  Serial.println(buf); PiSerial.println(buf);
   for (int i = 0; i < 4; i++) {
     if (tcpClients[i] && tcpClients[i].connected()) {
-      tcpClients[i].write((const uint8_t*)buf, n);
-      tcpClients[i].write('\n');
+      tcpClients[i].write((const uint8_t*)buf, n); tcpClients[i].write('\n');
     }
   }
 }
 
-// CONTROL DE MOTORES
 void setMotor(int in1, int in2, int ch, int speed) {
   int s = constrain(abs(speed), 0, 255);
-
-  if (speed > 0) {
-    digitalWrite(in1, HIGH);
-    digitalWrite(in2, LOW);
-  } else if (speed < 0) {
-    digitalWrite(in1, LOW);
-    digitalWrite(in2, HIGH);
-  } else {
-    digitalWrite(in1, LOW);
-    digitalWrite(in2, LOW);
-  }
-
+  if (speed > 0) { digitalWrite(in1, HIGH); digitalWrite(in2, LOW); } 
+  else if (speed < 0) { digitalWrite(in1, LOW); digitalWrite(in2, HIGH); } 
+  else { digitalWrite(in1, LOW); digitalWrite(in2, LOW); }
   ledcWrite(ch, s);
 }
 
-// LED de freno
 inline void stopLedOn()  { digitalWrite(LED_STOP, HIGH); }
 inline void stopLedOff() { digitalWrite(LED_STOP, LOW);  }
 
@@ -298,26 +202,19 @@ void steerRawRight() { setMotor(IN1, IN2, CH_STEER, +P.steerSpeed); steerMoveDir
 void steerRawStop()  { setMotor(IN1, IN2, CH_STEER, 0);             steerMoveDir = 0; }
 
 void steerTimed(int dir, int durMs) {
-  steerMoveDir = dir;
-  steerMoveDur = durMs;
-  steerMoveStart = millis();
-
+  steerMoveDir = dir; steerMoveDur = durMs; steerMoveStart = millis();
   if (dir > 0)      setMotor(IN1, IN2, CH_STEER, +P.steerSpeed);
   else if (dir < 0) setMotor(IN1, IN2, CH_STEER, -P.steerSpeed);
 }
 
-bool steerBusy() {
-  return steerMoveDir != 0;
-}
+bool steerBusy() { return steerMoveDir != 0; }
 
 void steerUpdate() {
   if (steerMoveDir == 0) return;
-
   unsigned long el = millis() - steerMoveStart;
   if (el >= (unsigned long)steerMoveDur) {
     steerPosMs = constrain(steerPosMs + steerMoveDir * steerMoveDur, 0, P.tSteerFullMs);
-    setMotor(IN1, IN2, CH_STEER, 0);
-    steerMoveDir = 0;
+    setMotor(IN1, IN2, CH_STEER, 0); steerMoveDir = 0;
   }
 }
 
@@ -336,161 +233,77 @@ void steerCalibrateHome() {
   setMotor(IN1, IN2, CH_STEER, -P.steerSpeed);
   delay(P.tSteerFullMs + 250);
   setMotor(IN1, IN2, CH_STEER, 0);
-  steerPosMs = 0;
-  steerMoveDir = 0;
+  steerPosMs = 0; steerMoveDir = 0;
 }
 
-void fullStop() {
-  driveStop();
-  steerRawStop();
-}
+void fullStop() { driveStop(); steerRawStop(); }
 
-// KICK START (vencer friccion estatica del motor parado)
-void armKickStart() {
-  kickStartT0 = millis();
-  kickStartActive = true;
-}
+void armKickStart() { kickStartT0 = millis(); kickStartActive = true; }
 
 void driveForwardKick(int cruise) {
   int s;
-  if (kickStartActive && (millis() - kickStartT0) < (unsigned long)P.kickStartMs) {
-    s = P.kickStartPWM;
-  } else {
-    kickStartActive = false;
-    s = cruise;
-  }
-  stopLedOff();
-  setMotor(IN3, IN4, CH_DRIVE, +s);
+  if (kickStartActive && (millis() - kickStartT0) < (unsigned long)P.kickStartMs) s = P.kickStartPWM;
+  else { kickStartActive = false; s = cruise; }
+  stopLedOff(); setMotor(IN3, IN4, CH_DRIVE, +s);
 }
 
 void driveReverseKick(int cruise) {
   int s;
-  if (kickStartActive && (millis() - kickStartT0) < (unsigned long)P.kickStartMs) {
-    s = P.kickStartPWM;
-  } else {
-    kickStartActive = false;
-    s = cruise;
-  }
-  stopLedOff();
-  setMotor(IN3, IN4, CH_DRIVE, -s);
+  if (kickStartActive && (millis() - kickStartT0) < (unsigned long)P.kickStartMs) s = P.kickStartPWM;
+  else { kickStartActive = false; s = cruise; }
+  stopLedOff(); setMotor(IN3, IN4, CH_DRIVE, -s);
 }
 
-// SENSORES ULTRASONICOS
 long medirCm(int trig, int echo) {
+  digitalWrite(trig, LOW); delayMicroseconds(2);
+  digitalWrite(trig, HIGH); delayMicroseconds(10);
   digitalWrite(trig, LOW);
-  delayMicroseconds(2);
-  digitalWrite(trig, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(trig, LOW);
-
   long dur = pulseIn(echo, HIGH, 25000);
   if (dur == 0) return 999;
   return dur * 0.0343 / 2;
 }
 
-void pushSiValido(MedianFilter& f, long v) {
-  if (v >= 5 && v < 999) f.push(v);
-}
+void pushSiValido(MedianFilter& f, long v) { if (v >= 5 && v < 999) f.push(v); }
 
 void leerSensores() {
-  pushSiValido(filtR, medirCm(TRIG_R, ECHO_R));
-  pushSiValido(filtL, medirCm(TRIG_L, ECHO_L));
-  pushSiValido(filtB, medirCm(TRIG_B, ECHO_B));
-  pushSiValido(filtF, medirCm(TRIG_F, ECHO_F));
-
-  lastR = filtR.get();
-  lastL = filtL.get();
-  lastB = filtB.get();
-  lastF = filtF.get();
+  pushSiValido(filtR, medirCm(TRIG_R, ECHO_R)); pushSiValido(filtL, medirCm(TRIG_L, ECHO_L));
+  pushSiValido(filtB, medirCm(TRIG_B, ECHO_B)); pushSiValido(filtF, medirCm(TRIG_F, ECHO_F));
+  lastR = filtR.get(); lastL = filtL.get(); lastB = filtB.get(); lastF = filtF.get();
 }
 
-// SEGUIDORES DE LINEA TCRT5000
 inline int readLineSensor(int pin) {
   int raw = digitalRead(pin);
 #if LINE_ACTIVE_LOW
-  return (raw == LOW) ? 1 : 0;   // LOW = ve linea blanca
+  return (raw == LOW) ? 1 : 0;
 #else
   return (raw == HIGH) ? 1 : 0;
 #endif
 }
 
-void leerLineas() {
-  lnL = readLineSensor(LINE_L);
-  lnR = readLineSensor(LINE_R);
-  lnC = readLineSensor(LINE_C);
-}
+void leerLineas() { lnL = readLineSensor(LINE_L); lnR = readLineSensor(LINE_R); lnC = readLineSensor(LINE_C); }
 
-// HAZARD TASK (intermitentes en core 0)
 void hazardTask(void *p) {
-  pinMode(LED_L, OUTPUT);
-  pinMode(LED_R, OUTPUT);
-
-  bool on = false;
-  int subStep = 0;
-
+  pinMode(LED_L, OUTPUT); pinMode(LED_R, OUTPUT);
+  bool on = false; int subStep = 0;
   while (true) {
     int delayMs = 300;
-
     switch (hazardMode) {
-      case 0:
-        digitalWrite(LED_L, LOW);
-        digitalWrite(LED_R, LOW);
-        delayMs = 100;
-        break;
-
-      case 1:
-        on = !on;
-        digitalWrite(LED_L, on);
-        digitalWrite(LED_R, on);
-        delayMs = 350;
-        break;
-
-      case 2:
-        on = !on;
-        digitalWrite(LED_L, on);
-        digitalWrite(LED_R, on);
-        delayMs = 120;
-        break;
-
-      case 3:
-        digitalWrite(LED_L, HIGH);
-        digitalWrite(LED_R, HIGH);
-        delayMs = 200;
-        break;
-
+      case 0: digitalWrite(LED_L, LOW); digitalWrite(LED_R, LOW); delayMs = 100; break;
+      case 1: on = !on; digitalWrite(LED_L, on); digitalWrite(LED_R, on); delayMs = 350; break;
+      case 2: on = !on; digitalWrite(LED_L, on); digitalWrite(LED_R, on); delayMs = 120; break;
+      case 3: digitalWrite(LED_L, HIGH); digitalWrite(LED_R, HIGH); delayMs = 200; break;
       case 4:
         subStep = (subStep + 1) % 6;
-        if (subStep == 0 || subStep == 2) {
-          digitalWrite(LED_L, HIGH);
-          digitalWrite(LED_R, HIGH);
-        } else {
-          digitalWrite(LED_L, LOW);
-          digitalWrite(LED_R, LOW);
-        }
-        delayMs = 120;
-        break;
+        if (subStep == 0 || subStep == 2) { digitalWrite(LED_L, HIGH); digitalWrite(LED_R, HIGH); } 
+        else { digitalWrite(LED_L, LOW); digitalWrite(LED_R, LOW); }
+        delayMs = 120; break;
     }
-
     vTaskDelay(delayMs / portTICK_PERIOD_MS);
   }
 }
 
-// AUTO PARK - maquina de estados
-void abortParking(const char* m) {
-  publishLine(String("ABORT,") + m);
-  fullStop();
-  hazardMode = 4;
-  mode = MANUAL;
-  parkState = ABORTADO;
-}
-
-void finishParking() {
-  publishLine("INFO,ESTACIONADO");
-  fullStop();
-  hazardMode = 3;
-  mode = MANUAL;
-  parkState = ESTACIONADO;
-}
+void abortParking(const char* m) { publishLine(String("ABORT,") + m); fullStop(); hazardMode = 4; mode = MANUAL; parkState = ABORTADO; }
+void finishParking() { publishLine("INFO,ESTACIONADO"); fullStop(); hazardMode = 3; mode = MANUAL; parkState = ESTACIONADO; }
 
 int tAvanceInicialMsEff() {
   if (P.tAvanceInicialMs > 0) return P.tAvanceInicialMs;
@@ -501,38 +314,20 @@ int tAvanceInicialMsEff() {
 int tAvanzarMedioMsEff() {
   if (P.tAvanzarHuecoMs > 0) return P.tAvanzarHuecoMs;
   if (P.cmPorSegPark <= 0) return 700;
-  int cm = P.carLargoCm / 2 + 4;
-  return cm * 1000 / P.cmPorSegPark;
+  return (P.carLargoCm / 2 + 4) * 1000 / P.cmPorSegPark;
 }
 
 void startParking(int side) {
-  parkSide = side;
-  publishLine(String("INFO,AUTO_PARK_START,") + (side > 0 ? "RIGHT" : "LEFT"));
-
-  mode = AUTO_PARK;
-  hazardMode = 2;
-  parkState = AVANCE_INICIAL;
-  stateStart = millis();
-  autoStart  = millis();
-
-  countCarro = 0;
-  countHueco = 0;
-  huecoT0 = 0;
-  huecoLastT = 0;
-  huecoLargoCm = 0;
-
-  steerCenter();
-  kickArmPending = true;
+  parkSide = side; publishLine(String("INFO,AUTO_PARK_START,") + (side > 0 ? "RIGHT" : "LEFT"));
+  mode = AUTO_PARK; hazardMode = 2; parkState = AVANCE_INICIAL;
+  stateStart = millis(); autoStart  = millis();
+  countCarro = 0; countHueco = 0; huecoT0 = 0; huecoLastT = 0; huecoLargoCm = 0;
+  steerCenter(); kickArmPending = true;
 }
 
 void parkingLoop() {
   if (mode != AUTO_PARK) return;
-
-  if (millis() - autoStart > (unsigned long)P.maxAutoMs) {
-    abortParking("watchdog");
-    return;
-  }
-
+  if (millis() - autoStart > (unsigned long)P.maxAutoMs) { abortParking("watchdog"); return; }
   long dLatPark  = (parkSide > 0) ? lastR : lastL;
   long dLatCalle = (parkSide > 0) ? lastL : lastR;
   long dBack     = lastB;
@@ -540,230 +335,111 @@ void parkingLoop() {
 
   switch (parkState) {
     case AVANCE_INICIAL: {
-      if (steerBusy()) {
-        driveStop();
-        break;
-      }
-
-      if (kickArmPending) {
-        armKickStart();
-        kickArmPending = false;
-      }
-
+      if (steerBusy()) { driveStop(); break; }
+      if (kickArmPending) { armKickStart(); kickArmPending = false; }
       driveForwardKick(P.parkDriveSpeed);
-
       if (millis() - stateStart > (unsigned long)tAvanceInicialMsEff()) {
-        publishLine("INFO,FIN_AVANCE_INICIAL");
-        parkState = MEDIR_HUECO;
-        stateStart = millis();
-        huecoT0 = 0;
-        huecoLastT = 0;
-        huecoLargoCm = 0;
-        countHueco = 0;
-        countCarro = 0;
-        hazardMode = 0;
+        publishLine("INFO,FIN_AVANCE_INICIAL"); parkState = MEDIR_HUECO; stateStart = millis();
+        huecoT0 = 0; huecoLastT = 0; huecoLargoCm = 0; countHueco = 0; countCarro = 0; hazardMode = 0;
       }
       break;
     }
-
     case MEDIR_HUECO: {
       driveForwardKick(P.parkDriveSpeed);
-
-      bool enHueco = (dLatPark > P.distHuecoCm);
-      bool enCarro = (dLatPark < P.distCarroCm);
-
+      bool enHueco = (dLatPark > P.distHuecoCm); bool enCarro = (dLatPark < P.distCarroCm);
       if (enHueco) {
         unsigned long now = millis();
-
-        if (huecoT0 == 0) {
-          huecoT0 = now;
-          huecoLastT = now;
-          huecoLargoCm = 0;
-          countHueco = 1;
-        } else {
-          unsigned long dt = now - huecoLastT;
-          huecoLastT = now;
-          huecoLargoCm += (int)(dt * (unsigned long)P.cmPorSegPark / 1000UL);
-          countHueco++;
-        }
-
+        if (huecoT0 == 0) { huecoT0 = now; huecoLastT = now; huecoLargoCm = 0; countHueco = 1; } 
+        else { unsigned long dt = now - huecoLastT; huecoLastT = now; huecoLargoCm += (int)(dt * (unsigned long)P.cmPorSegPark / 1000UL); countHueco++; }
         if (huecoLargoCm >= huecoMinCm && countHueco >= 3) {
           publishLine(String("INFO,HUECO_OK,") + huecoLargoCm);
-          hazardMode = 1;
-          parkState = AVANZAR_PASA_HUECO;
-          stateStart = millis();
-          armKickStart();
-          break;
+          hazardMode = 1; parkState = AVANZAR_PASA_HUECO; stateStart = millis(); armKickStart(); break;
         }
       } else if (enCarro) {
-        if (huecoT0 != 0) {
-          publishLine(String("INFO,HUECO_DESCARTADO,") + huecoLargoCm);
-        }
-        huecoT0 = 0;
-        huecoLastT = 0;
-        huecoLargoCm = 0;
-        countHueco = 0;
+        if (huecoT0 != 0) publishLine(String("INFO,HUECO_DESCARTADO,") + huecoLargoCm);
+        huecoT0 = 0; huecoLastT = 0; huecoLargoCm = 0; countHueco = 0;
       }
-
-      if (millis() - stateStart > 20000) {
-        abortParking("timeout_medir_hueco");
-      }
+      if (millis() - stateStart > 20000) abortParking("timeout_medir_hueco");
       break;
     }
-
     case AVANZAR_PASA_HUECO: {
       driveForwardKick(P.parkDriveSpeed);
       if (millis() - stateStart > (unsigned long)tAvanzarMedioMsEff()) {
-        driveStop();
-        if (parkSide > 0) steerFullRight();
-        else steerFullLeft();
-
-        parkState = STOP_Y_GIRAR;
-        stateStart = millis();
+        driveStop(); if (parkSide > 0) steerFullRight(); else steerFullLeft();
+        parkState = STOP_Y_GIRAR; stateStart = millis();
       }
       break;
     }
-
     case STOP_Y_GIRAR: {
       driveStop();
-      if (!steerBusy()) {
-        publishLine("INFO,DIRECCION_GIRADA");
-        parkState = REVERSA_GIRO;
-        stateStart = millis();
-        armKickStart();
-      }
+      if (!steerBusy()) { publishLine("INFO,DIRECCION_GIRADA"); parkState = REVERSA_GIRO; stateStart = millis(); armKickStart(); }
       break;
     }
-
     case REVERSA_GIRO: {
       if (dLatPark < 4)  { abortParking("lateral_park_muy_cerca"); break; }
       if (dLatCalle < 6) { abortParking("lateral_calle_muy_cerca"); break; }
-
       driveReverseKick(P.parkDriveSpeed);
-
       if (dBack < P.distFrenaSuaveCm && dBack >= 5) {
-        driveStop();
-        publishLine("INFO,REVERSA_GIRO_FIN_SUAVE");
-        parkState = STOP_Y_ENDEREZAR;
-        stateStart = millis();
-        steerCenter();
-        break;
+        driveStop(); publishLine("INFO,REVERSA_GIRO_FIN_SUAVE"); parkState = STOP_Y_ENDEREZAR; stateStart = millis(); steerCenter(); break;
       }
-
       if (millis() - stateStart > (unsigned long)P.tReversaGiroMs) {
-        driveStop();
-        publishLine("INFO,REVERSA_GIRO_TIMEOUT");
-        parkState = STOP_Y_ENDEREZAR;
-        stateStart = millis();
-        steerCenter();
+        driveStop(); publishLine("INFO,REVERSA_GIRO_TIMEOUT"); parkState = STOP_Y_ENDEREZAR; stateStart = millis(); steerCenter();
       }
       break;
     }
-
     case STOP_Y_ENDEREZAR: {
       driveStop();
-      if (!steerBusy()) {
-        publishLine("INFO,DIRECCION_CENTRADA");
-        parkState = REVERSA_RECTA;
-        stateStart = millis();
-        armKickStart();
-      }
+      if (!steerBusy()) { publishLine("INFO,DIRECCION_CENTRADA"); parkState = REVERSA_RECTA; stateStart = millis(); armKickStart(); }
       break;
     }
-
     case REVERSA_RECTA: {
       if (dLatPark < 4)  { abortParking("lateral_park_muy_cerca"); break; }
       if (dLatCalle < 6) { abortParking("lateral_calle_muy_cerca"); break; }
-
       driveReverseKick((int)(P.parkDriveSpeed * 0.7));
-
       int dParo = P.distParaYaCm + P.margenBanquetaCm;
-      if (dBack >= 5 && dBack < dParo) {
-        finishParking();
-        break;
-      }
-
-      if (millis() - stateStart > 4000) {
-        publishLine("INFO,REVERSA_RECTA_TIMEOUT");
-        finishParking();
-      }
+      if (dBack >= 5 && dBack < dParo) { finishParking(); break; }
+      if (millis() - stateStart > 4000) { publishLine("INFO,REVERSA_RECTA_TIMEOUT"); finishParking(); }
       break;
     }
-
-    default:
-      break;
+    default: break;
   }
 }
 
-// LINE FOLLOW - corrige direccion con TCRT5000
 void startLineFollow() {
-  if (mode == AUTO_PARK) {
-    publishLine("ERR,LF_BLOCKED_BY_AUTO_PARK");
-    return;
-  }
+  if (mode == AUTO_PARK) { publishLine("ERR,LF_BLOCKED_BY_AUTO_PARK"); return; }
   publishLine("INFO,LF_START");
-  mode = LINE_FOLLOW;
-  hazardMode = 1;          // intermitente lento, se ve que esta en automatico
-  lfStart = millis();
-  lfLastSteerTarget = -1;
-  lfCruceStart = 0;
-  lfSlowUntil  = 0;
-  armKickStart();
+  mode = LINE_FOLLOW; hazardMode = 1; lfStart = millis();
+  lfLastSteerTarget = -1; lfCruceStart = 0; lfSlowUntil  = 0; armKickStart();
 }
 
 void stopLineFollow(const char* reason) {
   publishLine(String("INFO,LF_STOP,") + reason);
-  driveStop();
-  hazardMode = 0;
-  mode = MANUAL;
-  lfLastSteerTarget = -1;
+  driveStop(); hazardMode = 0; mode = MANUAL; lfLastSteerTarget = -1;
 }
 
 void lineFollowLoop() {
   if (mode != LINE_FOLLOW) return;
+  if (millis() - lfStart > 30000UL) { stopLineFollow("watchdog_30s"); return; }
 
-  // Watchdog: 30s maximo (incluye posibles esperas en cruces)
-  if (millis() - lfStart > 30000UL) {
-    stopLineFollow("watchdog_30s");
-    return;
-  }
-
-  // ---- CRUCE PEATONAL: detenerse 10 segundos ----
   if (lfCruceStart > 0) {
-    driveStop();
+    driveStop(); 
     if (millis() - lfCruceStart >= 10000UL) {
-      // Fin de espera - reanudar circuito
-      hazardMode = 1;         // volver a intermitente de LF
-      lfCruceStart = 0;
-      lfStart = millis();     // reiniciar watchdog
-      armKickStart();
-      lfLastSteerTarget = -1;
+      hazardMode = 1; lfCruceStart = 0; lfStart = millis(); armKickStart(); lfLastSteerTarget = -1;
       publishLine("INFO,LF_CRUCE_FIN,REANUDANDO");
     }
     return;
   }
 
-  // ---- VELOCIDAD: reducida en curva, normal en recta ----
   int curSpeed = P.lineFollowSpeed;
-  if (millis() < lfSlowUntil) {
-    curSpeed = P.lineFollowSpeed * 60 / 100;  // 60% en curva
-    stopLedOn();
-  } else {
-    stopLedOff();
-    driveForwardKick(curSpeed);
-  }
-  if (millis() < lfSlowUntil) {
-    // En frenado de curva no usar kick, aplicar directo
-    setMotor(IN3, IN4, CH_DRIVE, +curSpeed);
-  }
+  if (millis() < lfSlowUntil) { curSpeed = P.lineFollowSpeed * 60 / 100; stopLedOn(); } 
+  else { stopLedOff(); driveForwardKick(curSpeed); }
+  
+  if (millis() < lfSlowUntil) { setMotor(IN3, IN4, CH_DRIVE, +curSpeed); }
 
   int center    = P.tSteerFullMs / 2 + P.steerTrimMs;
-  int leftFull  = 0;
-  int rightFull = P.tSteerFullMs;
-  int leftSoft  = (int)(P.tSteerFullMs * 0.35);
-  int rightSoft = (int)(P.tSteerFullMs * 0.65);
-
-  int target = lfLastSteerTarget;   // por defecto mantener
+  int leftFull  = 0; int rightFull = P.tSteerFullMs;
+  int leftSoft  = (int)(P.tSteerFullMs * 0.35); int rightSoft = (int)(P.tSteerFullMs * 0.65);
+  int target = lfLastSteerTarget;
 
   if      ( lnC && !lnL && !lnR) target = center;
   else if ( lnC &&  lnL && !lnR) target = leftSoft;
@@ -771,164 +447,81 @@ void lineFollowLoop() {
   else if (!lnC &&  lnL && !lnR) target = leftFull;
   else if (!lnC && !lnL &&  lnR) target = rightFull;
   else if (!lnC &&  lnL &&  lnR) {
-    // CRUCE PEATONAL detectado (ambos laterales ven blanco)
-    publishLine("INFO,LF_CRUCE_DETECTADO");
-    hazardMode = 2;     // intermitentes rapidos
-    stopLedOn();
-    driveStop();
+    publishLine("INFO,LF_CRUCE_PEATONAL_DETECTADO");
+    hazardMode = 2;
+    driveStop(); 
     lfCruceStart = millis();
     lfLastSteerTarget = -1;
     return;
   }
-  // C=0 L=0 R=0 (perdido), C=1 L=1 R=1 (parche): mantener
 
   if (target != lfLastSteerTarget && target >= 0 && !steerBusy()) {
-    // Detectar cambio de sentido (recta -> curva): frenar un poco
     bool eraRecto   = (lfLastSteerTarget == center || lfLastSteerTarget < 0);
     bool ahoraCurva = (target == leftFull || target == rightFull);
-    if (!eraRecto && ahoraCurva) {
-      // Curva pronunciada: bajar velocidad 350 ms
-      lfSlowUntil = millis() + 350;
-      publishLine("INFO,LF_CURVA");
-    }
-    steerGoTo(target);
-    lfLastSteerTarget = target;
+    if (!eraRecto && ahoraCurva) { lfSlowUntil = millis() + 350; publishLine("INFO,LF_CURVA"); }
+    steerGoTo(target); lfLastSteerTarget = target;
   }
 }
 
-// TEST PARK - prueba ciega de la maniobra de estacionamiento en bateria
 void startTestPark(int side) {
-  if (mode == AUTO_PARK) {
-    publishLine("ERR,TPARK_BLOCKED_BY_AUTO_PARK");
-    return;
-  }
-  tpSide = side;
-  tpStep = 0;
-  tpStepStart = millis();
-  mode = TEST_PARK;
-  hazardMode = 0;
-  parkState = IDLE;
-
+  if (mode == AUTO_PARK) { publishLine("ERR,TPARK_BLOCKED_BY_AUTO_PARK"); return; }
+  tpSide = side; tpStep = 0; tpStepStart = millis(); mode = TEST_PARK; hazardMode = 0; parkState = IDLE;
   publishLine(String("INFO,TPARK_START,") + (side > 0 ? "RIGHT" : "LEFT"));
-  publishLine("INFO,TPARK_PASO_0,COUNTDOWN_LEDS");
 }
 
 void testParkLoop() {
   if (mode != TEST_PARK) return;
-
   unsigned long elapsed = millis() - tpStepStart;
-
   switch (tpStep) {
     case 0: {
       driveStop();
       int blinkPhase = (int)(elapsed / 333);
-      if (blinkPhase % 2 == 0) {
-        digitalWrite(LED_L, HIGH);
-        digitalWrite(LED_R, HIGH);
-      } else {
-        digitalWrite(LED_L, LOW);
-        digitalWrite(LED_R, LOW);
-      }
+      if (blinkPhase % 2 == 0) { digitalWrite(LED_L, HIGH); digitalWrite(LED_R, HIGH); } 
+      else { digitalWrite(LED_L, LOW); digitalWrite(LED_R, LOW); }
       if (elapsed > 2000) {
-        digitalWrite(LED_L, LOW);
-        digitalWrite(LED_R, LOW);
-        armKickStart();
-        tpStep = 1;
-        tpStepStart = millis();
-        publishLine("INFO,TPARK_PASO_1,AVANCE_RECTO");
-        parkState = AVANCE_INICIAL;
+        digitalWrite(LED_L, LOW); digitalWrite(LED_R, LOW); armKickStart();
+        tpStep = 1; tpStepStart = millis(); parkState = AVANCE_INICIAL;
       }
       break;
     }
-
     case 1: {
       driveForwardKick(P.parkDriveSpeed);
-      int tAvance = tAvanceInicialMsEff();
-      if (elapsed > (unsigned long)tAvance) {
-        driveStop();
-        hazardMode = 1;  // encender intermitentes
-        tpStep = 2;
-        tpStepStart = millis();
-        publishLine("INFO,TPARK_PASO_2,FRENO_CON_HAZARDS");
-        parkState = AVANZAR_PASA_HUECO;
+      if (elapsed > (unsigned long)tAvanceInicialMsEff()) {
+        driveStop(); hazardMode = 1; tpStep = 2; tpStepStart = millis(); parkState = AVANZAR_PASA_HUECO;
       }
       break;
     }
-
     case 2: {
       driveStop();
-      if (elapsed > 500) {
-        hazardMode = 0;
-        if (tpSide > 0) steerFullLeft();
-        else steerFullRight();
-        armKickStart();
-        tpStep = 3;
-        tpStepStart = millis();
-        publishLine("INFO,TPARK_PASO_3,AVANCE_CON_GIRO_OPUESTO_1S");
-        parkState = STOP_Y_GIRAR;
-      }
+      if (elapsed > 500) { hazardMode = 0; if (tpSide > 0) steerFullLeft(); else steerFullRight(); armKickStart(); tpStep = 3; tpStepStart = millis(); parkState = STOP_Y_GIRAR; }
       break;
     }
-
     case 3: {
       driveForwardKick(P.parkDriveSpeed);
-      if (elapsed > 1000) {
-        driveStop();
-        if (tpSide > 0) steerFullRight();
-        else steerFullLeft();
-        armKickStart();
-        tpStep = 4;
-        tpStepStart = millis();
-        publishLine("INFO,TPARK_PASO_4,REVERSA_CON_GIRO_2S");
-        parkState = REVERSA_GIRO;
-      }
+      if (elapsed > 1000) { driveStop(); if (tpSide > 0) steerFullRight(); else steerFullLeft(); armKickStart(); tpStep = 4; tpStepStart = millis(); parkState = REVERSA_GIRO; }
       break;
     }
-
     case 4: {
       driveReverseKick(P.parkDriveSpeed);
-      if (elapsed > 2000) {
-        driveStop();
-        steerCenter();
-        armKickStart();
-        tpStep = 5;
-        tpStepStart = millis();
-        publishLine("INFO,TPARK_PASO_5,REVERSA_RECTA_5S");
-        parkState = REVERSA_RECTA;
-      }
+      if (elapsed > 2000) { driveStop(); steerCenter(); armKickStart(); tpStep = 5; tpStepStart = millis(); parkState = REVERSA_RECTA; }
       break;
     }
-
     case 5: {
       driveReverseKick((int)(P.parkDriveSpeed * 0.75));
-      if (elapsed > 5000) {
-        driveStop();
-        tpStep = 6;
-        tpStepStart = millis();
-        publishLine("INFO,TPARK_PASO_6,FIN");
-        parkState = ESTACIONADO;
-        finishParking();
-      }
+      if (elapsed > 5000) { driveStop(); tpStep = 6; tpStepStart = millis(); parkState = ESTACIONADO; finishParking(); }
       break;
     }
   }
 }
 
-// PARAMETROS POR COMANDO (SET:clave=valor)
 void applyParam(const String& k, int v) {
   if      (k=="driveSpeed")        P.driveSpeed        = constrain(v,0,255);
   else if (k=="parkDriveSpeed")    P.parkDriveSpeed    = constrain(v,0,255);
   else if (k=="steerSpeed")        P.steerSpeed        = constrain(v,0,255);
   else if (k=="tSteerFullMs")      P.tSteerFullMs      = constrain(v,100,1500);
   else if (k=="steerTrimMs")       P.steerTrimMs       = constrain(v,-150,150);
-  else if (k=="distCarroCm") {
-    P.distCarroCm = constrain(v,5,100);
-    if (P.distHuecoCm < P.distCarroCm + 10) P.distHuecoCm = P.distCarroCm + 10;
-  }
-  else if (k=="distHuecoCm") {
-    P.distHuecoCm = constrain(v,10,200);
-    if (P.distHuecoCm < P.distCarroCm + 10) P.distHuecoCm = P.distCarroCm + 10;
-  }
+  else if (k=="distCarroCm")       P.distCarroCm       = constrain(v,5,100);
+  else if (k=="distHuecoCm")       P.distHuecoCm       = constrain(v,10,200);
   else if (k=="distFrenaSuaveCm")  P.distFrenaSuaveCm  = constrain(v,3,50);
   else if (k=="distParaYaCm")      P.distParaYaCm      = constrain(v,2,30);
   else if (k=="tAvanceInicialMs")  P.tAvanceInicialMs  = constrain(v,0,10000);
@@ -948,11 +541,9 @@ void applyParam(const String& k, int v) {
   else if (k=="lineFollowSpeed")   P.lineFollowSpeed   = constrain(v,0,255);
 }
 
-// PARSER DE COMANDOS
 void handleCommand(String cmd, const String& sourceName) {
   cmd.trim();
-  cmd.toUpperCase(); // <--- SOLUCION APLICADA PARA FORZAR MAYUSCULAS
-  
+  cmd.toUpperCase(); 
   if (cmd.length() == 0) return;
 
   lastAnyCmdMs = millis();
@@ -961,96 +552,72 @@ void handleCommand(String cmd, const String& sourceName) {
   if (cmd.startsWith("SET:")) {
     int eq = cmd.indexOf('=');
     if (eq > 4) {
-      String k = cmd.substring(4, eq);
-      int v = cmd.substring(eq + 1).toInt();
-      applyParam(k, v);
-      publishLine("INFO,SET_OK," + k + "," + String(v));
-    } else {
-      publishLine("ERR,BAD_SET_FORMAT");
+      String k = cmd.substring(4, eq); int v = cmd.substring(eq + 1).toInt();
+      applyParam(k, v); publishLine("INFO,SET_OK," + k + "," + String(v));
     }
     return;
   }
 
-  if (cmd.equals("PING")) {
-    publishLine("PONG");
-    return;
+  if (cmd.equals("PING")) { publishLine("PONG"); return; }
+  
+  bool isMovement = (cmd == "W" || cmd == "S" || cmd == "A" || cmd == "D" || cmd == "C");
+
+  // SECCION DE BLINDAJE: Si el ESP32 está haciendo algo autónomo, ignoramos los comandos de movimiento 
+  // que sigan llegando de la Raspberry Pi (UART) para que la IA no nos cancele el Seguidor de Linea
+  if ((mode == AUTO_PARK || mode == TEST_PARK || mode == LINE_FOLLOW) && sourceName == "UART" && isMovement) {
+    return; 
   }
 
-  if (mode == AUTO_PARK && cmd != "PR" && cmd != "PL") {
-    abortParking("manual_override");
-  }
-  if (mode == TEST_PARK && cmd != "TPARKR" && cmd != "TPARKL") {
-    publishLine("INFO,TPARK_CANCELLED");
-    fullStop();
-    mode = MANUAL;
-    parkState = ABORTADO;
-  }
-
-  if (mode == LINE_FOLLOW &&
-      (cmd == "W" || cmd == "S" || cmd == "X" ||
-       cmd == "A" || cmd == "D" || cmd == "C" ||
-       cmd == "ESTOP")) {
+  // Cancelacion manual desde GUI (TCP) o paros de emergencia
+  if (mode == AUTO_PARK && cmd != "PR" && cmd != "PL") abortParking("manual_override");
+  if (mode == TEST_PARK && cmd != "TPARKR" && cmd != "TPARKL") { publishLine("INFO,TPARK_CANCELLED"); fullStop(); mode = MANUAL; parkState = ABORTADO; }
+  if (mode == LINE_FOLLOW && (isMovement || cmd == "X" || cmd == "ESTOP" || cmd == "STOP")) {
     stopLineFollow("manual_override");
   }
 
-  if      (cmd == "PR")     { if (mode == MANUAL) startParking(+1); }
+  // Comandos para elegir el modo de la Inteligencia Artificial (hacia la Pi)
+  if      (cmd == "IA_ONLY") { PiSerial.println("IA_ONLY"); publishLine("INFO,MODO_IA_SOLO"); return; }
+  else if (cmd == "IA_LF")   { PiSerial.println("IA_LF"); publishLine("INFO,MODO_IA_Y_LF"); return; }
+  
+  // Comandos para probar los focos del freno
+  if      (cmd == "BRAKE_ON")  { stopLedOn(); publishLine("INFO,LUCES_FRENO_ENCENDIDAS"); return; }
+  else if (cmd == "BRAKE_OFF") { stopLedOff(); publishLine("INFO,LUCES_FRENO_APAGADAS"); return; }
+
+  if      (cmd == "STOP")   { mode = MANUAL; driveStop(); publishLine("INFO,STOP_SEÑAL_RECIBIDO"); }
+  else if (cmd == "PR")     { if (mode == MANUAL) startParking(+1); }
   else if (cmd == "PL")     { if (mode == MANUAL) startParking(-1); }
   else if (cmd == "TPARKR") { startTestPark(+1); }
   else if (cmd == "TPARKL") { startTestPark(-1); }
-  else if (cmd == "LF")    { startLineFollow(); }
-  else if (cmd == "NOLF")  { if (mode == LINE_FOLLOW) stopLineFollow("nolf_cmd"); }
-  else if (cmd == "T")     { mode = (mode == SENSOR_TEST) ? MANUAL : SENSOR_TEST; publishLine("INFO,MODE," + modeToString()); }
-  else if (cmd == "H")     { hazardMode = (hazardMode == 0) ? 1 : 0; publishLine("INFO,HAZARD," + String(hazardMode)); }
-  else if (cmd == "HAZON") { hazardMode = 1; publishLine("INFO,HAZARD_ON"); }
-  else if (cmd == "HAZOFF"){ hazardMode = 0; publishLine("INFO,HAZARD_OFF"); }
-  else if (cmd == "CAL")   { steerCalibrateHome(); steerCenter(); publishLine("INFO,CAL_OK"); }
-  else if (cmd == "ESTOP") { abortParking("estop"); fullStop(); }
-  else if (cmd == "W")     { mode = MANUAL; driveForward(); }
-  else if (cmd == "S")     { mode = MANUAL; driveReverse(); }
-  else if (cmd == "X")     { mode = MANUAL; driveStop(); }
-  else if (cmd == "A")     { mode = MANUAL; steerRawLeft(); }
-  else if (cmd == "D")     { mode = MANUAL; steerRawRight(); }
-  else if (cmd == "C")     { mode = MANUAL; steerRawStop(); }
-  else {
-    publishLine("ERR,UNKNOWN_COMMAND");
-  }
+  else if (cmd == "LF")     { startLineFollow(); }
+  else if (cmd == "NOLF")   { if (mode == LINE_FOLLOW) stopLineFollow("nolf_cmd"); }
+  else if (cmd == "T")      { mode = (mode == SENSOR_TEST) ? MANUAL : SENSOR_TEST; }
+  else if (cmd == "H")      { hazardMode = (hazardMode == 0) ? 1 : 0; }
+  else if (cmd == "HAZON")  { hazardMode = 1; }
+  else if (cmd == "HAZOFF") { hazardMode = 0; }
+  else if (cmd == "CAL")    { steerCalibrateHome(); steerCenter(); }
+  else if (cmd == "ESTOP")  { abortParking("estop"); fullStop(); }
+  else if (cmd == "W")      { mode = MANUAL; driveForward(); }
+  else if (cmd == "S")      { mode = MANUAL; driveReverse(); }
+  else if (cmd == "X")      { mode = MANUAL; driveStop(); }
+  else if (cmd == "A")      { mode = MANUAL; steerRawLeft(); }
+  else if (cmd == "D")      { mode = MANUAL; steerRawRight(); }
+  else if (cmd == "C")      { mode = MANUAL; steerRawStop(); }
 }
 
-// TCP - servidor para hasta 4 clientes
 void acceptNewClients() {
   if (tcpServer.hasClient()) {
     WiFiClient newClient = tcpServer.available();
-
     int freeSlot = -1;
-    for (int i = 0; i < 4; i++) {
-      if (!tcpClients[i] || !tcpClients[i].connected()) {
-        freeSlot = i;
-        break;
-      }
-    }
-
+    for (int i = 0; i < 4; i++) { if (!tcpClients[i] || !tcpClients[i].connected()) { freeSlot = i; break; } }
     if (freeSlot >= 0) {
       if (tcpClients[freeSlot]) tcpClients[freeSlot].stop();
-
-      tcpClients[freeSlot] = newClient;
-      tcpBuffers[freeSlot] = "";
-
-      tcpClients[freeSlot].println("INFO,TCP_CONNECTED");
-      publishLine("INFO,TCP_CLIENT_CONNECTED," + String(freeSlot));
-    } else {
-      newClient.println("ERR,NO_FREE_SLOT");
-      newClient.stop();
-    }
+      tcpClients[freeSlot] = newClient; tcpBuffers[freeSlot] = "";
+    } else newClient.stop();
   }
 }
 
 void cleanupClients() {
-  for (int i = 0; i < 4; i++) {
-    if (tcpClients[i] && !tcpClients[i].connected()) {
-      tcpClients[i].stop();
-      tcpBuffers[i] = "";
-    }
-  }
+  for (int i = 0; i < 4; i++) { if (tcpClients[i] && !tcpClients[i].connected()) { tcpClients[i].stop(); tcpBuffers[i] = ""; } }
 }
 
 void readTcpCommands() {
@@ -1058,148 +625,54 @@ void readTcpCommands() {
     if (tcpClients[i] && tcpClients[i].connected()) {
       while (tcpClients[i].available()) {
         char c = (char)tcpClients[i].read();
-
-        if (c == '\n') {
-          handleCommand(tcpBuffers[i], "TCP");
-          tcpBuffers[i] = "";
-        } else if (c != '\r') {
-          tcpBuffers[i] += c;
-          if (tcpBuffers[i].length() > 200) {
-            tcpBuffers[i] = "";
-            publishLine("ERR,TCP_BUFFER_OVERFLOW");
-          }
-        }
+        if (c == '\n') { handleCommand(tcpBuffers[i], "TCP"); tcpBuffers[i] = ""; } 
+        else if (c != '\r') { tcpBuffers[i] += c; if (tcpBuffers[i].length() > 200) tcpBuffers[i] = ""; }
       }
     }
   }
 }
 
-// UART - lee comandos de la Raspberry Pi
 void readUARTCommands() {
   while (PiSerial.available()) {
     char c = (char)PiSerial.read();
-
-    if (c == '\n') {
-      handleCommand(uartBuffer, "UART");
-      uartBuffer = "";
-    } else if (c != '\r') {
-      uartBuffer += c;
-      if (uartBuffer.length() > 200) {
-        uartBuffer = "";
-        publishLine("ERR,UART_BUFFER_OVERFLOW");
-      }
-    }
+    if (c == '\n') { handleCommand(uartBuffer, "UART"); uartBuffer = ""; } 
+    else if (c != '\r') { uartBuffer += c; if (uartBuffer.length() > 200) uartBuffer = ""; }
   }
 }
 
-// TIMEOUT DE SEGURIDAD GLOBAL
 void handleGlobalTimeout() {
-  if (mode == AUTO_PARK)   return;
-  if (mode == LINE_FOLLOW) return;
-  if (mode == TEST_PARK)   return;
-
-  unsigned long now = millis();
-  if (now - lastAnyCmdMs > GLOBAL_CMD_TIMEOUT_MS) {
-    driveStop();
-    steerRawStop();
-  }
+  if (mode == AUTO_PARK || mode == LINE_FOLLOW || mode == TEST_PARK) return;
+  if (millis() - lastAnyCmdMs > GLOBAL_CMD_TIMEOUT_MS) fullStop();
 }
 
-// SETUP
 void setup() {
   Serial.begin(115200);
-  delay(500);
-  Serial.println("BOOTING...");
-
   PiSerial.begin(115200, SERIAL_8N1, UART_RX_PIN, UART_TX_PIN);
 
-  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
-  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
-
-  pinMode(TRIG_R, OUTPUT); pinMode(ECHO_R, INPUT);
-  pinMode(TRIG_L, OUTPUT); pinMode(ECHO_L, INPUT);
-  pinMode(TRIG_B, OUTPUT); pinMode(ECHO_B, INPUT);
-  pinMode(TRIG_F, OUTPUT); pinMode(ECHO_F, INPUT);
-
-  pinMode(LINE_L, INPUT);
-  pinMode(LINE_R, INPUT);
-  pinMode(LINE_C, INPUT);
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT); pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+  pinMode(TRIG_R, OUTPUT); pinMode(ECHO_R, INPUT); pinMode(TRIG_L, OUTPUT); pinMode(ECHO_L, INPUT);
+  pinMode(TRIG_B, OUTPUT); pinMode(ECHO_B, INPUT); pinMode(TRIG_F, OUTPUT); pinMode(ECHO_F, INPUT);
+  pinMode(LINE_L, INPUT); pinMode(LINE_R, INPUT); pinMode(LINE_C, INPUT);
 
   pinMode(LED_STOP, OUTPUT);
   digitalWrite(LED_STOP, LOW);
 
-  ledcSetup(CH_STEER, PWM_FREQ, PWM_RES);
-  ledcSetup(CH_DRIVE, PWM_FREQ, PWM_RES);
-  ledcAttachPin(ENA, CH_STEER);
-  ledcAttachPin(ENB, CH_DRIVE);
+  ledcSetup(CH_STEER, PWM_FREQ, PWM_RES); ledcSetup(CH_DRIVE, PWM_FREQ, PWM_RES);
+  ledcAttachPin(ENA, CH_STEER); ledcAttachPin(ENB, CH_DRIVE);
 
-  fullStop();
-  delay(400);
-  steerCalibrateHome();
-  steerCenter();
+  fullStop(); delay(400); steerCalibrateHome(); steerCenter();
 
-  WiFi.disconnect(true, true);
-  delay(500);
-  WiFi.mode(WIFI_OFF);
-  delay(500);
-  WiFi.mode(WIFI_AP);
-  delay(500);
-
-  bool apOk = WiFi.softAP(AP_SSID, AP_PASS);
-  delay(1000);
-
-  if (apOk) {
-    Serial.println("AP creado correctamente");
-    Serial.print("SSID: ");
-    Serial.println(AP_SSID);
-    Serial.print("IP del AP: ");
-    Serial.println(WiFi.softAPIP());
-  } else {
-    Serial.println("ERR,WIFI_AP_FAIL");
-  }
-
-  tcpServer.begin();
-  tcpServer.setNoDelay(true);
-
+  WiFi.mode(WIFI_AP); WiFi.softAP(AP_SSID, AP_PASS);
+  tcpServer.begin(); tcpServer.setNoDelay(true);
   xTaskCreatePinnedToCore(hazardTask, "hazard", 2048, NULL, 1, NULL, 0);
-
   lastAnyCmdMs = millis();
-
-  publishLine("INFO,SYSTEM_READY");
-  publishLine("INFO,TCP_PORT,8080");
-  publishLine("INFO,UART_READY,115200");
-  publishLine("INFO,MODE,MANUAL");
 }
 
-// LOOP PRINCIPAL (~100 Hz)
 void loop() {
-  steerUpdate();
-  leerSensores();
-  leerLineas();
+  steerUpdate(); leerSensores(); leerLineas();
+  acceptNewClients(); cleanupClients(); readTcpCommands(); readUARTCommands();
+  parkingLoop(); lineFollowLoop(); testParkLoop(); handleGlobalTimeout();
 
-  acceptNewClients();
-  cleanupClients();
-  readTcpCommands();
-  readUARTCommands();
-
-  parkingLoop();
-  lineFollowLoop();
-  testParkLoop();
-  handleGlobalTimeout();
-
-  if (millis() - lastTelemetryMs >= TELEMETRY_INTERVAL_MS) {
-    lastTelemetryMs = millis();
-    sendTelemetry();
-  }
-
-  static unsigned long tPrint = 0;
-  if (mode == SENSOR_TEST && millis() - tPrint > 500) {
-    tPrint = millis();
-    Serial.printf("R:%ld  L:%ld  B:%ld  F:%ld  ln:%d%d%d\n",
-                  lastR, lastL, lastB, lastF, lnL, lnC, lnR);
-    PiSerial.printf("R:%ld  L:%ld  B:%ld  F:%ld  ln:%d%d%d\n",
-                    lastR, lastL, lastB, lastF, lnL, lnC, lnR);
-  }
-
+  if (millis() - lastTelemetryMs >= TELEMETRY_INTERVAL_MS) { lastTelemetryMs = millis(); sendTelemetry(); }
   delay(10);
 }
