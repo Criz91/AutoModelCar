@@ -1,40 +1,40 @@
 """
-AutoModelCar - Cerebro autonomo para Raspberry Pi 5 + chip Hailo
-TMR 2026 - Categoria AutoModelCar
+AutoModelCar Cerebro autonomo para Raspberry Pi 5 + chip Hailo
+TMR 2026 Categoria AutoModelCar
 
 Este script corre dentro del carro, montado sobre la Raspberry Pi 5.
 Toma video con la picamera2, segmenta el carril con la red lane.hef
-acelerada por el chip Hailo, y manda comandos al ESP32-S3 por UART.
+acelerada por el chip Hailo, y manda comandos al ESP32S3 por UART.
 
-Comandos enviados al ESP (texto plano, terminado en '\n'):
-    W   avanzar
-    A   girar a la izquierda
-    D   girar a la derecha
-    X   detener
-    LF  entrar a modo line-follow local del ESP (curva cerrada)
-    NOLF salir de modo line-follow y volver a control desde la Pi
+Comandos enviados al ESP (texto plano, terminado en salto de linea):
+    W  avanzar
+    A  girar a la izquierda
+    D  girar a la derecha
+    X  detener
+    LF  entrar a modo linefollow local del ESP (curva cerrada)
+    NOLF salir de modo linefollow y volver a control desde la Pi
 
 Algoritmo de decision de carril (grid ponderado):
     El frame se divide en una cuadricula de FILAS x 5 columnas.
     Las filas de abajo (mas cerca del carro) pesan mas que las de arriba
     (curva lejana). Con esos pesos se calcula el centroide horizontal
-    del carril detectado: un numero de -1 (todo a la izquierda) a +1
+    del carril detectado: un numero de 1 (todo a la izquierda) a +1
     (todo a la derecha). Eso se mapea a A / W / D con histeresis para
     no cambiar de comando en cada frame y evitar zigzag.
 
     VELOCIDAD_AUTONOMA: la Pi baja la velocidad del ESP al arrancar para
     que el procesamiento de Hailo pueda seguir el ritmo del movimiento.
 
-Handoff Hailo <-> Line Follow (cuando los seguidores esten conectados):
+Handoff Hailo y Line Follow (cuando los seguidores esten conectados):
     Si la actividad del mask baja del umbral por varios frames seguidos,
     se asume que la IA perdio el carril (curva cerrada) y se manda LF.
     El ESP entonces usa los TCRT5000 localmente. Cuando la IA recupera
     el carril, manda NOLF y retoma el control.
 
 Uso:
-    python3 master_autonomo_hailo.py              # modo normal
-    python3 master_autonomo_hailo.py --test       # prueba UART y camara
-    python3 master_autonomo_hailo.py --test-drive # secuencia W/A/D sin IA
+    python3 master_autonomo_hailo.py               modo normal
+    python3 master_autonomo_hailo.py test          prueba UART y camara
+    python3 master_autonomo_hailo.py testdrive     secuencia W/A/D sin IA
 """
 
 import os
@@ -71,7 +71,7 @@ except ImportError:
 if _FALTAN:
     print("ERROR: faltan dependencias para correr el cerebro:")
     for d in _FALTAN:
-        print("  -", d)
+        print("  ", d)
     print("Instala todo y vuelve a correr.")
     sys.exit(1)
 
@@ -104,46 +104,44 @@ UMBRAL_ACTIVIDAD = 0.05
 
 # Error maximo del centroide para considerar que el carro va recto.
 # Un error fuera de este rango manda A o D.
-UMBRAL_ERROR_GIRO = 0.30   # rango [-1,1]; 0.30 = 30% desviado
+UMBRAL_ERROR_GIRO = 0.30   # rango [-1,1]; 0.30 es 30 porciento desviado
 
 # Suavizado: cuantos frames consecutivos con el mismo comando se necesitan
-# antes de cambiar a otro. 1 = reaccion inmediata (mejor para curvas),
-# 2+ = mas estable pero mas lento. Bajar si el carro llega tarde a las curvas.
+# antes de cambiar a otro. 1 es reaccion inmediata (mejor para curvas),
+# mas de 2 es mas estable pero mas lento. Bajar si el carro llega tarde a las curvas.
 CONFIRMACIONES_CAMBIO = 1
 
-BLACKOUT_FRAMES = 5       # frames consecutivos sin carril -> entra a LF
-RECOVER_FRAMES  = 4       # frames consecutivos con carril -> sale de LF
+BLACKOUT_FRAMES = 5       # frames consecutivos sin carril activa LF
+RECOVER_FRAMES  = 4       # frames consecutivos con carril desactiva LF
 HISTERESIS      = 1.5     # multiplicador del umbral para recuperarse
 
-# ---- Deteccion de señales (detect-supremo.hef) ----
+# Configuracion Deteccion de senales detectsupremo.hef
 MODELO_DETECT = "detect-supremo.hef"
 
-# Indice de clase "stop sign" en el modelo. Ejecuta el script una vez y
-# busca la linea "[DETECT-INFO] clase=N ..." para identificar el indice.
-# Si el modelo usa nombres, pon el nombre exacto en DETECT_NOMBRE_STOP.
-DETECT_CLASE_STOP   = None   # None = imprimir todo, luego poner el indice correcto
+# Indice de clase stop sign en el modelo. Corregido a 2 segun indicaciones.
+DETECT_CLASE_STOP   = 2  
 DETECT_NOMBRE_STOP  = "stop" # nombre alternativo para buscar en la salida del modelo
 
 # Confianza minima para considerar una deteccion valida [0..1]
 DETECT_CONF_MIN = 0.50
 
 # Fraccion del area del frame a partir de la cual se activa cada fase:
-#   APROX: bbox ocupa el X% del frame -> hazards on + desacelerar (proximidad)
-#   STOP:  bbox ocupa el Y% del frame -> frenar 10 s (esta muy cerca)
-DETECT_AREA_APROX = 0.04   # 4% del frame = se esta acercando
-DETECT_AREA_STOP  = 0.10   # 10% del frame = ya esta cerca, frenar
+#   APROX: bbox ocupa el X porciento del frame enciende hazards on y desacelera
+#   STOP:  bbox ocupa el Y porciento del frame frena 10 s
+DETECT_AREA_APROX = 0.04   # 4 porciento del frame se esta acercando
+DETECT_AREA_STOP  = 0.10   # 10 porciento del frame ya esta cerca, frenar
 
 # Velocidad reducida durante la fase de aproximacion al stop
 VELOCIDAD_APROX = 150
 
-# Segundos que el carro permanece parado en el stop / paso peatonal
+# Segundos que el carro permanece parado en el stop o paso peatonal
 STOP_ESPERA_S = 10
 
 # Cooldown tras reanudar: no volver a detectar el mismo stop por N segundos
 STOP_COOLDOWN_S = 20
 
 # Cada cuantos frames de carril se corre la inferencia de deteccion.
-# Hailo-8 corre los dos modelos en VDevice separados (un hilo cada uno).
+# Hailo-8 corre los dos modelos en VDevice separados.
 # Este valor solo controla cada cuanto el hilo de carril copia el frame
 # para que el hilo de deteccion lo procese.
 DETECT_FEED_INTERVALO = 6
@@ -161,12 +159,12 @@ class CarroCerebro:
         self.telemetria_esp = ""
         self.error_fatal = None   # si un hilo truena, guarda el mensaje
 
-        # Deteccion de señales de transito
+        # Deteccion de senales de transito
         self.frame_detect = None       # ultimo frame RGB para que el hilo detect lo analice
         self.frame_detect_lock = threading.Lock()
-        self.frame_detect_event = threading.Event()  # señal: hay frame nuevo
-        self.parada_activa = False     # True = stop detectado, carril no manda comandos
-        self.stop_state = "normal"     # "normal" | "aproximando" | "detenido" | "cooldown"
+        self.frame_detect_event = threading.Event()  # senal: hay frame nuevo
+        self.parada_activa = False     # True es stop detectado, carril no manda comandos
+        self.stop_state = "normal"     # normal, aproximando, detenido, cooldown
         self.stop_state_since = 0.0    # timestamp de cambio de estado
 
 
@@ -181,17 +179,18 @@ def abrir_uart():
             print("[OK] UART abierto en", puerto)
             return s
         except Exception as e:
-            print("[--] UART", puerto, "no disponible:", e)
+            print("[  ] UART", puerto, "no disponible:", e)
     print("[ERROR] No se pudo abrir ningun puerto UART.")
-    print("        Verifica que el puerto serie este habilitado en raspi-config")
-    print("        y que el cable UART Pi<->ESP este conectado.")
+    print("        Verifica que el puerto serie este habilitado en raspiconfig")
+    print("        y que el cable UART Pi ESP este conectado.")
     return None
 
 
 def enviar_comando(cmd, uart):
-    """Envia un comando al ESP si el puerto esta disponible."""
+    """Envia un comando al ESP si el puerto esta disponible asegurando mayusculas."""
     if uart is None:
         return
+    cmd = cmd.upper()  # FORZAR MAYUSCULAS CRITICO PARA ESP32
     try:
         uart.write((cmd + "\n").encode("ascii"))
         uart.flush()
@@ -233,21 +232,10 @@ def loop_inteligencia(uart):
         enviar_comando("NOLF", uart)
 
 
-# ---------------------------------------------------------------------------
-# HILO DE DETECCION DE SEÑALES (detect-supremo.hef)
-# Corre en paralelo al hilo de carril, usando su propio VDevice de Hailo.
-# Recibe frames del hilo de carril via cerebro.frame_detect y actualiza
-# cerebro.stop_state para pausar el avance cuando detecta un stop.
-# ---------------------------------------------------------------------------
-
 def _parse_detecciones(output_dict, img_h, img_w, primer_frame):
     """
-    Intenta parsear la salida de detect-supremo.hef y devuelve una lista de
-    (clase_id_o_nombre, confianza, area_relativa) para cada deteccion valida.
-
-    Como el formato exacto del modelo no es conocido de antemano, en el
-    primer frame imprime la forma de todos los tensores de salida para que
-    el usuario pueda ajustar DETECT_CLASE_STOP.
+    Intenta parsear la salida de detectsupremo.hef y devuelve una lista de
+    clase_id_o_nombre, confianza, area_relativa para cada deteccion valida.
     """
     detecciones = []
 
@@ -255,12 +243,10 @@ def _parse_detecciones(output_dict, img_h, img_w, primer_frame):
         arr = np.squeeze(tensor)   # quitar dimension de batch
 
         if primer_frame:
-            print("[DETECT-INFO] key='{}' shape={} dtype={}".format(
+            print("[DETECT-INFO] key={} shape={} dtype={}".format(
                 key, arr.shape, arr.dtype))
 
-        # Caso 1: tensor plano de detecciones [N, 5+C] o [N, 6]
-        # donde cada fila es [x1, y1, x2, y2, conf, class_id] o
-        # [x_c, y_c, w, h, conf, class_id]
+        # Caso 1 tensor plano de detecciones [N, 5+C] o [N, 6]
         if arr.ndim == 2 and arr.shape[-1] >= 6:
             for row in arr:
                 conf = float(row[4])
@@ -270,9 +256,7 @@ def _parse_detecciones(output_dict, img_h, img_w, primer_frame):
                 class_id  = int(class_val) if arr.shape[-1] == 6 else class_val
                 # Calcular area del bounding box relativa al frame
                 if arr.shape[-1] >= 6:
-                    # Intentar como (x1,y1,x2,y2)
                     x1, y1, x2, y2 = float(row[0]), float(row[1]), float(row[2]), float(row[3])
-                    # Si coordenadas son normalizadas (0..1)
                     if x2 <= 1.0 and y2 <= 1.0:
                         area = abs((x2 - x1) * (y2 - y1))
                     else:
@@ -284,7 +268,7 @@ def _parse_detecciones(output_dict, img_h, img_w, primer_frame):
                         class_id, conf, area))
                 detecciones.append((class_id, conf, area))
 
-        # Caso 2: tensor [N, 85] estilo YOLOv5 (4 bbox + 1 obj + 80 clases)
+        # Caso 2 tensor [N, 85] estilo YOLOv5
         elif arr.ndim == 2 and arr.shape[-1] == 85:
             for row in arr:
                 obj_conf = float(row[4])
@@ -296,7 +280,7 @@ def _parse_detecciones(output_dict, img_h, img_w, primer_frame):
                     continue
                 x_c, y_c, bw, bh = row[0], row[1], row[2], row[3]
                 area = float(bw * bh)
-                if x_c > 1.0:  # coordenadas absolutas
+                if x_c > 1.0:
                     area /= (img_w * img_h)
                 if primer_frame:
                     print("[DETECT-INFO]   clase={} conf={:.2f} area={:.3f}".format(
@@ -309,13 +293,12 @@ def _parse_detecciones(output_dict, img_h, img_w, primer_frame):
 def _es_stop(clase_id):
     """Devuelve True si la clase corresponde a un stop sign."""
     if DETECT_CLASE_STOP is None:
-        # No configurado aun: imprimir pero no activar
         return False
     return int(clase_id) == int(DETECT_CLASE_STOP)
 
 
 def _loop_deteccion_inner(uart):
-    """Logica del hilo de deteccion de señales."""
+    """Logica del hilo de deteccion de senales."""
     try:
         from hailo_platform import HEF, VDevice, InputVStreamParams, OutputVStreamParams, InferVStreams
     except ImportError:
@@ -325,7 +308,7 @@ def _loop_deteccion_inner(uart):
     script_dir = os.path.dirname(os.path.abspath(__file__))
     detect_path = os.path.join(script_dir, MODELO_DETECT)
     if not os.path.exists(detect_path):
-        print("[DETECT] No se encontro '{}'. Hilo de deteccion desactivado.".format(detect_path))
+        print("[DETECT] No se encontro {}. Hilo de deteccion desactivado.".format(detect_path))
         print("[DETECT] Coloca detect-supremo.hef en:", script_dir)
         return
 
@@ -341,14 +324,13 @@ def _loop_deteccion_inner(uart):
         return
 
     primer_frame = True
-    stop_cooldown_end = 0.0   # timestamp hasta cuando NO detectar (cooldown)
+    stop_cooldown_end = 0.0   # timestamp hasta cuando NO detectar
 
     with ng.activate():
         params_in  = InputVStreamParams.make(ng)
         params_out = OutputVStreamParams.make(ng)
         with InferVStreams(ng, params_in, params_out) as pipe:
             while not cerebro.stop_event.is_set():
-                # Esperar frame nuevo del hilo de carril (max 0.5s)
                 got_frame = cerebro.frame_detect_event.wait(timeout=0.5)
                 cerebro.frame_detect_event.clear()
 
@@ -360,7 +342,7 @@ def _loop_deteccion_inner(uart):
                 if frame_rgb is None:
                     continue
 
-                # Pre-procesar para el modelo de deteccion
+                # Preprocesar para el modelo de deteccion
                 img_h, img_w = frame_rgb.shape[:2]
                 try:
                     det_in_info = hef.get_input_vstream_infos()[0]
@@ -383,11 +365,11 @@ def _loop_deteccion_inner(uart):
 
                 ahora = time.time()
 
-                # ---- Cooldown: ignorar detecciones por un tiempo tras reanudar ----
+                # Cooldown ignorar detecciones por un tiempo tras reanudar
                 if ahora < stop_cooldown_end:
                     continue
 
-                # ---- Buscar stop sign con mayor area ----
+                # Buscar stop sign con mayor area
                 mejor_area = 0.0
                 for (clase_id, conf, area) in dets:
                     if _es_stop(clase_id) and area > mejor_area:
@@ -395,27 +377,27 @@ def _loop_deteccion_inner(uart):
 
                 estado_actual = cerebro.stop_state
 
-                # ---- Maquina de estados 2 fases ----
+                # Maquina de estados 2 fases
                 if estado_actual == "normal":
                     if mejor_area >= DETECT_AREA_APROX:
-                        # Fase 1: aproximandose al stop
+                        # Fase 1 aproximandose al stop
                         cerebro.stop_state = "aproximando"
                         cerebro.stop_state_since = ahora
                         enviar_comando("HAZON", uart)
                         enviar_comando("SET:driveSpeed={}".format(VELOCIDAD_APROX), uart)
-                        print("[STOP] Aproximando al stop (area={:.3f})".format(mejor_area))
+                        print("[STOP] Aproximando al stop area={:.3f}".format(mejor_area))
 
                 elif estado_actual == "aproximando":
                     if mejor_area >= DETECT_AREA_STOP:
-                        # Fase 2: detenerse
+                        # Fase 2 detenerse
                         cerebro.parada_activa = True
                         cerebro.stop_state = "detenido"
                         cerebro.stop_state_since = ahora
                         enviar_comando("X", uart)
-                        print("[STOP] Detenido en stop (area={:.3f}). Esperando {}s".format(
+                        print("[STOP] Detenido en stop area={:.3f}. Esperando {}s".format(
                             mejor_area, STOP_ESPERA_S))
                     elif mejor_area < DETECT_AREA_APROX * 0.5:
-                        # Perdio el stop: volver a normal
+                        # Perdio el stop volver a normal
                         cerebro.stop_state = "normal"
                         enviar_comando("HAZOFF", uart)
                         enviar_comando("SET:driveSpeed={}".format(VELOCIDAD_AUTONOMA), uart)
@@ -423,7 +405,7 @@ def _loop_deteccion_inner(uart):
 
                 elif estado_actual == "detenido":
                     if (ahora - cerebro.stop_state_since) >= STOP_ESPERA_S:
-                        # Fin de espera: reanudar
+                        # Fin de espera reanudar
                         cerebro.stop_state = "cooldown"
                         cerebro.parada_activa = False
                         enviar_comando("HAZOFF", uart)
@@ -431,7 +413,7 @@ def _loop_deteccion_inner(uart):
                         enviar_comando("W", uart)
                         cerebro.ultimo_comando = "W"
                         stop_cooldown_end = ahora + STOP_COOLDOWN_S
-                        print("[STOP] Reanudando circuito (cooldown {}s)".format(STOP_COOLDOWN_S))
+                        print("[STOP] Reanudando circuito cooldown {}s".format(STOP_COOLDOWN_S))
 
                 elif estado_actual == "cooldown":
                     if ahora >= stop_cooldown_end:
@@ -446,13 +428,11 @@ def loop_deteccion(uart):
     except Exception as e:
         print("[DETECT] Hilo de deteccion murio:", e)
         traceback.print_exc()
-        # No es fatal: el hilo de carril sigue funcionando
 
 
 def _loop_inteligencia_inner(uart):
     """Logica real del hilo de IA, separada para manejar excepciones arriba."""
 
-    # Importar picamera2 y hailo aqui para que el error sea claro
     try:
         from picamera2 import Picamera2
     except ImportError:
@@ -475,33 +455,27 @@ def _loop_inteligencia_inner(uart):
             "Instala el SDK de Hailo segun la documentacion oficial."
         )
 
-    # Buscar el modelo HEF
     script_dir = os.path.dirname(os.path.abspath(__file__))
     modelo_path = os.path.join(script_dir, MODELO_LANE)
     if not os.path.exists(modelo_path):
         raise RuntimeError(
-            "No se encontro el modelo '{}'. "
-            "Coloca el archivo lane.hef en la misma carpeta que este script ({}).".format(
-                MODELO_LANE, script_dir
-            )
+            "No se encontro el modelo. "
+            "Coloca el archivo lane.hef en la misma carpeta que este script."
         )
 
-    # Camara
-    print("[..] Iniciando picamera2...")
+    print("[  ] Iniciando picamera2...")
     picam2 = Picamera2()
     picam2.configure(picam2.create_preview_configuration({"size": (640, 480)}))
     picam2.start()
     print("[OK] Camara lista.")
 
-    # Hailo
-    print("[..] Cargando modelo Hailo:", modelo_path)
+    print("[  ] Cargando modelo Hailo:", modelo_path)
     target = VDevice()
     hef = HEF(modelo_path)
     network_group = target.configure(hef)[0]
     input_name = hef.get_input_vstream_infos()[0].name
     print("[OK] Hailo listo. Input:", input_name)
 
-    # Bajar velocidad del ESP para que Hailo pueda seguir el ritmo del carro
     enviar_comando("SET:driveSpeed={}".format(VELOCIDAD_AUTONOMA), uart)
     print("[OK] Velocidad autonoma enviada: driveSpeed={}".format(VELOCIDAD_AUTONOMA))
 
@@ -522,7 +496,6 @@ def _loop_inteligencia_inner(uart):
             print("[OK] Cerebro activo. Analizando carril a", IMG_SIZE, "x", IMG_SIZE)
 
             while not cerebro.stop_event.is_set():
-                # Captura y pre-procesado
                 frame_raw = picam2.capture_array()
                 frames_total += 1
 
@@ -536,15 +509,13 @@ def _loop_inteligencia_inner(uart):
                     input_name: np.expand_dims(img_resized, axis=0).astype(np.uint8)
                 }
 
-                # Inferencia
                 out = pipe.infer(input_data)
                 mask = list(out.values())[0][0].astype(np.float32)
 
-                # --- Grid ponderado GRID_FILAS x GRID_COLS ---
+                # Grid ponderado
                 h, w = mask.shape[:2]
                 row_h = h // GRID_FILAS
                 col_w = w // GRID_COLS
-                # Posicion horizontal normalizada de cada columna: -1 (izq) a +1 (der)
                 col_pos = np.linspace(-1.0, 1.0, GRID_COLS)
 
                 numerador    = 0.0
@@ -564,17 +535,13 @@ def _loop_inteligencia_inner(uart):
                         numerador   += celda_ponderada * col_pos[c]
                         denominador += celda_ponderada
 
-                # Actividad media normalizada por pixeles (independiente del
-                # rango de valores de la mascara; UMBRAL_ACTIVIDAD en misma escala)
                 actividad_norm = actividad_total / (h * w) if h * w > 0 else 0.0
 
-                # Centroide horizontal ponderado: -1 = todo izq, +1 = todo der
                 if denominador > 0.0:
                     centroid_error = float(np.clip(numerador / denominador, -1.0, 1.0))
                 else:
                     centroid_error = 0.0
 
-                # Diagnostico cada ~30 frames (~1 seg)
                 if frames_total % 30 == 0:
                     print(
                         "[IA] frame={} act={:.3f} err={:+.2f} cmd={} LF={} bo={} rc={}".format(
@@ -584,7 +551,7 @@ def _loop_inteligencia_inner(uart):
                         )
                     )
 
-                # Deteccion de blackout / recovery
+                # Deteccion de blackout recovery
                 if actividad_norm < UMBRAL_ACTIVIDAD:
                     blackout_cnt += 1
                     recover_cnt = 0
@@ -593,7 +560,7 @@ def _loop_inteligencia_inner(uart):
                         cerebro.modo_LF = True
                         cerebro.ultimo_comando = "LF"
                         lf_start_time = time.time()
-                        print("[LF] Blackout detectado, entrando a line-follow")
+                        print("[LF] Blackout detectado, entrando a linefollow")
                 else:
                     blackout_cnt = 0
                     if cerebro.modo_LF:
@@ -609,8 +576,6 @@ def _loop_inteligencia_inner(uart):
                         else:
                             recover_cnt = 0
 
-                # Timeout LF: si lleva mucho tiempo en LF sin recuperar,
-                # forzar salida para no quedarse atorado
                 if cerebro.modo_LF and lf_start_time > 0:
                     if (time.time() - lf_start_time) > LF_TIMEOUT_S:
                         enviar_comando("NOLF", uart)
@@ -618,26 +583,23 @@ def _loop_inteligencia_inner(uart):
                         cerebro.ultimo_comando = ""
                         lf_start_time = 0
                         blackout_cnt = 0
-                        print("[LF] Timeout {}s, forzando salida de line-follow".format(
+                        print("[LF] Timeout {}s, forzando salida de linefollow".format(
                             LF_TIMEOUT_S))
 
-                # Compartir frame con el hilo de deteccion cada N frames
                 if frames_total % DETECT_FEED_INTERVALO == 0:
                     with cerebro.frame_detect_lock:
                         cerebro.frame_detect = img_rgb.copy()
                     cerebro.frame_detect_event.set()
 
-                # Decision de direccion con centroide ponderado
-                # (solo si NO en LF y NO en parada por señal)
+                # Decision de direccion
                 if not cerebro.modo_LF and not cerebro.parada_activa:
                     if centroid_error < -UMBRAL_ERROR_GIRO:
-                        nuevo_cmd = "A"   # masa a la izquierda -> girar izquierda
+                        nuevo_cmd = "A"
                     elif centroid_error > UMBRAL_ERROR_GIRO:
-                        nuevo_cmd = "D"   # masa a la derecha  -> girar derecha
+                        nuevo_cmd = "D"
                     else:
-                        nuevo_cmd = "W"   # centrado           -> avanzar recto
+                        nuevo_cmd = "W"
 
-                    # Suavizado: solo cambiar comando si se confirma N frames
                     if nuevo_cmd == cmd_candidato_prev:
                         confirmaciones += 1
                     else:
@@ -650,10 +612,9 @@ def _loop_inteligencia_inner(uart):
                         cerebro.ultimo_comando = nuevo_cmd
                         confirmaciones = 0
 
-                # --- Visualizacion para el monitor web ---
+                # Visualizacion para web
                 frame_viz = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
 
-                # Cuadricula del grid (gris horizontal, amarillo vertical)
                 for r in range(1, GRID_FILAS):
                     y = r * (480 // GRID_FILAS)
                     cv2.line(frame_viz, (0, y), (640, y), (80, 80, 80), 1)
@@ -661,7 +622,6 @@ def _loop_inteligencia_inner(uart):
                     x = c * (640 // GRID_COLS)
                     cv2.line(frame_viz, (x, 0), (x, 480), (255, 255, 0), 1)
 
-                # Linea del centroide (verde) y linea central de referencia (rojo)
                 cx = int((centroid_error + 1.0) / 2.0 * 640)
                 cv2.line(frame_viz, (cx, 0), (cx, 480), (0, 255, 0), 2)
                 cv2.line(frame_viz, (320, 0), (320, 480), (0, 0, 200), 1)
@@ -696,74 +656,69 @@ def _loop_inteligencia_inner(uart):
 
 
 def test_uart_y_camara():
-    """Modo de prueba: verifica UART y camara sin necesitar Hailo."""
-    print("=== MODO DE PRUEBA ===")
+    """Modo de prueba verifica UART y camara sin necesitar Hailo."""
+    print("MODO DE PRUEBA")
     print()
 
-    # 1. UART
     uart = abrir_uart()
     if uart is None:
-        print("UART: FALLO. Verifica raspi-config y el cableado.")
+        print("UART FALLO. Verifica raspiconfig y el cableado.")
     else:
-        print("UART: OK. Mandando PING al ESP...")
+        print("UART OK. Mandando PING al ESP...")
         enviar_comando("PING", uart)
         time.sleep(0.5)
         respuesta = ""
         while uart.in_waiting:
             respuesta += uart.read(uart.in_waiting).decode("ascii", errors="ignore")
         if "PONG" in respuesta:
-            print("UART: El ESP respondio PONG. Comunicacion OK.")
+            print("UART El ESP respondio PONG. Comunicacion OK.")
         else:
-            print("UART: No llego PONG. Respuesta:", repr(respuesta))
+            print("UART No llego PONG. Respuesta:", repr(respuesta))
             print("      Verifica que el ESP tenga el firmware cargado")
-            print("      y que TX de la Pi va a RX del ESP (y viceversa).")
+            print("      y que TX de la Pi va a RX del ESP y viceversa.")
         print()
 
-        # Probar mover el carro brevemente
-        print("UART: Mandando W durante 0.5 s para probar traccion...")
+        print("UART Mandando W durante 0.5 s para probar traccion...")
         enviar_comando("W", uart)
         time.sleep(0.5)
         enviar_comando("X", uart)
-        print("UART: Si el carro avanzo y freno, la traccion funciona.")
+        print("UART Si el carro avanzo y freno, la traccion funciona.")
         print()
 
-    # 2. Camara
     try:
         from picamera2 import Picamera2
-        print("Picamera2: importado OK.")
+        print("Picamera2 importado OK.")
         picam2 = Picamera2()
         picam2.configure(picam2.create_preview_configuration({"size": (640, 480)}))
         picam2.start()
         frame = picam2.capture_array()
-        print("Picamera2: captura OK. Shape:", frame.shape)
+        print("Picamera2 captura OK. Shape:", frame.shape)
         picam2.stop()
     except ImportError:
-        print("Picamera2: NO INSTALADO. sudo apt install python3-picamera2")
+        print("Picamera2 NO INSTALADO. sudo apt install python3-picamera2")
     except Exception as e:
-        print("Picamera2: ERROR:", e)
+        print("Picamera2 ERROR:", e)
     print()
 
-    # 3. Hailo
     try:
         from hailo_platform import HEF
-        print("Hailo: importado OK.")
+        print("Hailo importado OK.")
         script_dir = os.path.dirname(os.path.abspath(__file__))
         modelo_path = os.path.join(script_dir, MODELO_LANE)
         if os.path.exists(modelo_path):
-            print("Hailo: modelo", MODELO_LANE, "encontrado.")
+            print("Hailo modelo", MODELO_LANE, "encontrado.")
         else:
-            print("Hailo: FALTA el modelo", MODELO_LANE)
+            print("Hailo FALTA el modelo", MODELO_LANE)
             print("      Coloca lane.hef en:", script_dir)
     except ImportError:
-        print("Hailo: NO INSTALADO. Instala el SDK oficial de Hailo.")
+        print("Hailo NO INSTALADO. Instala el SDK oficial de Hailo.")
     print()
 
-    print("=== FIN DE PRUEBA ===")
+    print("FIN DE PRUEBA")
     if uart:
         uart.close()
 
 
-# Servidor FastAPI - monitoreo remoto del video por WiFi
 app = FastAPI()
 
 
@@ -806,7 +761,7 @@ def status():
 
 
 def shutdown(signum, frame):
-    """Stop graceful: detener motores y salir de LF antes de cerrar."""
+    """Stop graceful detener motores y salir de LF antes de cerrar."""
     print("Deteniendo cerebro...")
     cerebro.stop_event.set()
     if _uart_global is not None:
@@ -820,17 +775,13 @@ _uart_global = None
 
 
 def test_drive():
-    """Modo --test-drive: manda una secuencia de comandos por UART sin
+    """Modo testdrive manda una secuencia de comandos por UART sin
     necesitar Hailo, camara ni seguidores de linea. Solo prueba que la
-    comunicacion Pi -> UART -> ESP funciona y que el carro se mueve.
+    comunicacion Pi UART ESP funciona y que el carro se mueve.
 
-    Uso: python3 master_autonomo_hailo.py --test-drive
-
-    Mientras corre, mira el log de la GUI: deben aparecer lineas
-    RX,UART,W / RX,UART,A / etc. Si no aparecen, el UART no esta
-    conectado o los cables TX/RX estan invertidos.
+    Uso: python3 master_autonomo_hailo.py testdrive
     """
-    print("=== TEST DRIVE (sin IA, sin camara, sin seguidores) ===")
+    print("TEST DRIVE sin IA, sin camara, sin seguidores")
     print()
     uart = abrir_uart()
     if uart is None:
@@ -864,45 +815,42 @@ def test_drive():
         ("X",  0.5, "Frenar"),
     ]
 
-    print("Secuencia de prueba ({} pasos):".format(len(pasos)))
+    print("Secuencia de prueba {} pasos:".format(len(pasos)))
     for cmd, dur, desc in pasos:
-        print("  {} -> {} ({:.1f}s)".format(cmd, desc, dur))
+        print("  {}  {} {:.1f}s".format(cmd, desc, dur))
     print()
 
-    input("Presiona ENTER para empezar (el carro se va a mover)...")
+    input("Presiona ENTER para empezar el carro se va a mover...")
     print()
 
     for i, (cmd, dur, desc) in enumerate(pasos):
-        print("[{}/{}] {} -> {}".format(i + 1, len(pasos), cmd, desc))
+        print("[{}/{}] {}  {}".format(i + 1, len(pasos), cmd, desc))
         enviar_comando(cmd, uart)
         time.sleep(dur)
 
     enviar_comando("X", uart)
     print()
     print("[OK] Secuencia terminada.")
-    print("    Si el carro se movio, la comunicacion Pi->ESP funciona.")
+    print("    Si el carro se movio, la comunicacion Pi ESP funciona.")
     print("    Si no se movio, revisa:")
-    print("      - Que GPIO14(TX) de la Pi va a GPIO16(RX) del ESP")
-    print("      - Que GPIO15(RX) de la Pi va a GPIO17(TX) del ESP")
-    print("      - Que comparten GND")
+    print("      Que GPIO14TX de la Pi va a GPIO16RX del ESP")
+    print("      Que GPIO15RX de la Pi va a GPIO17TX del ESP")
+    print("      Que comparten GND")
     uart.close()
 
 
 if __name__ == "__main__":
-    # Modo test: verifica hardware sin Hailo
-    if len(sys.argv) > 1 and sys.argv[1] == "--test":
+    if len(sys.argv) > 1 and sys.argv[1] == "test":
         test_uart_y_camara()
         sys.exit(0)
 
-    # Modo test-drive: prueba UART mandando W/A/D/S sin IA
-    if len(sys.argv) > 1 and sys.argv[1] == "--test-drive":
+    if len(sys.argv) > 1 and sys.argv[1] == "testdrive":
         test_drive()
         sys.exit(0)
 
-    print("AutoModelCar - Cerebro autonomo TMR 2026")
+    print("AutoModelCar Cerebro autonomo TMR 2026")
     print()
 
-    # Abrir UART
     _uart_global = abrir_uart()
     if _uart_global is None:
         print("Sin UART el carro no se va a mover.")
@@ -918,13 +866,10 @@ if __name__ == "__main__":
     t_tel = threading.Thread(target=loop_lectura_telemetria, args=(_uart_global,), daemon=True)
     t_tel.start()
 
-    # Hilo de deteccion de señales (detect-supremo.hef) - usa su propio VDevice
     t_det = threading.Thread(target=loop_deteccion, args=(_uart_global,), daemon=True)
     t_det.start()
 
-    # Esperar a que el hilo de IA arranque o falle. Hailo puede tardar
-    # varios segundos en cargar el modelo, asi que damos 10 segundos.
-    print("[..] Esperando a que el hilo de IA arranque (hasta 10s)...")
+    print("[  ] Esperando a que el hilo de IA arranque hasta 10s...")
     time.sleep(10)
     if cerebro.error_fatal:
         print()
@@ -932,14 +877,14 @@ if __name__ == "__main__":
         print(" ", cerebro.error_fatal)
         print()
         print("Corrige el error y vuelve a correr.")
-        print("Tip: usa 'python3 master_autonomo_hailo.py --test'")
+        print("Tip: usa python3 master_autonomo_hailo.py test")
         print("     para diagnosticar pieza por pieza.")
         sys.exit(1)
 
     print()
     print("Monitor web activo en http://[IP_DE_LA_PI]:5000")
-    print("  /          -> video MJPEG")
-    print("  /status    -> estado del cerebro")
-    print("  /telemetria -> ultima telemetria del ESP")
+    print("  /          video MJPEG")
+    print("  /status    estado del cerebro")
+    print("  /telemetria ultima telemetria del ESP")
     print()
     uvicorn.run(app, host="0.0.0.0", port=5000, log_level="error")
