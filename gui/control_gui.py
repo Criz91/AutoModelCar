@@ -61,23 +61,53 @@ class App(tk.Tk):
 
         self._construir_ui()
         self._drenar_cola()
+        
         # Trackers para no inundar el log
         self.ultimo_modo = None
         self.ultimo_estado = None
 
-        # Bindings de teclado (Bug 4)
-        self.bind_all('<KeyPress>', self._on_tecla)
+        # Bindings de teclado (Bug 4) con control Anti-Tartamudeo
+        self.teclas_presionadas = {}
+        self.teclas_timers = {} 
+        self.bind_all('<KeyPress>', self._on_tecla_press)
+        self.bind_all('<KeyRelease>', self._on_tecla_release)
 
-    def _on_tecla(self, event):
+    def _on_tecla_press(self, event):
         # Ignorar teclado si el usuario está escribiendo en la IP o Puerto
-        if isinstance(self.focus_get(), tk.Entry):
-            return
-            
+        if isinstance(self.focus_get(), tk.Entry): return
+        
         tecla = event.char.upper()
-        if tecla in ["W", "A", "S", "D", "X", "C"]:
-            self.enviar(tecla)
-        elif event.keysym == "space":
-            self.enviar("X") # Barra espaciadora frena todo
+        
+        # Cancelar el timer de release si existe (filtro anti-tartamudeo)
+        if tecla in self.teclas_timers:
+            self.after_cancel(self.teclas_timers[tecla])
+            del self.teclas_timers[tecla]
+            
+        if not self.teclas_presionadas.get(tecla, False):
+            self.teclas_presionadas[tecla] = True
+            if tecla in ["W", "A", "S", "D"]:
+                self.enviar(tecla)
+            elif event.keysym == "space":
+                self.enviar("X") # Barra espaciadora frena todo
+
+    def _on_tecla_release(self, event):
+        if isinstance(self.focus_get(), tk.Entry): return
+        tecla = event.char.upper()
+        
+        # Retrasar el release 50ms para ignorar el auto-repeat falso del sistema operativo
+        timer = self.after(50, lambda: self._ejecutar_release(tecla))
+        self.teclas_timers[tecla] = timer
+
+    def _ejecutar_release(self, tecla):
+        self.teclas_presionadas[tecla] = False
+        if tecla in self.teclas_timers:
+            del self.teclas_timers[tecla]
+            
+        # Al soltar, mandar el comando de detener correspondiente
+        if tecla in ["W", "S"]:
+            self.enviar("X") # Frena traccion
+        elif tecla in ["A", "D"]:
+            self.enviar("C") # Frena direccion
 
     # ── Construccion de la UI ─────────────────────────────────────────────────
 
@@ -170,6 +200,17 @@ class App(tk.Tk):
         self._btn_ctrl(cruz, "D\nDir Der",  1, 2, "D")
         self._btn_ctrl(cruz, "C\nDir Stop", 2, 1, "C", color=COLOR_TEXTO_DIM)
         self._btn_ctrl(cruz, "S\nReversa",  3, 1, "S")
+        # Botones de Test de Topes
+        test_frame = tk.Frame(grp, bg=COLOR_PANEL)
+        test_frame.pack(fill=tk.X, pady=(10, 0))
+        
+        tk.Button(test_frame, text="TEST TOPE IZQ", bg=COLOR_BOTON, fg=COLOR_AMARILLO,
+                  font=("Segoe UI", 8, "bold"), cursor="hand2", relief=tk.FLAT,
+                  command=lambda: self.enviar("TEST_DIR:IZQ")).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
+                  
+        tk.Button(test_frame, text="TEST TOPE DER", bg=COLOR_BOTON, fg=COLOR_AMARILLO,
+                  font=("Segoe UI", 8, "bold"), cursor="hand2", relief=tk.FLAT,
+                  command=lambda: self.enviar("TEST_DIR:DER")).pack(side=tk.LEFT, expand=True, fill=tk.X, padx=2)
 
     def _btn_ctrl(self, padre, texto, fila, col, cmd, color=None):
         color = color or COLOR_AZUL

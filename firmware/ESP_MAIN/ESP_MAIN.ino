@@ -606,6 +606,32 @@ void procesarComando(String cmd) {
         return;
     }
 
+    //Comandos para el Test de Topes Seguro 
+    if (cmd == "TEST_DIR:IZQ") {
+        Serial.println("Test Tope Izquierdo...");
+        digitalWrite(PIN_IN1, HIGH);
+        digitalWrite(PIN_IN2, LOW);
+        ledcWrite(CH_DIRECCION, P.velocidadDireccion);
+        delay(P.tiempoDireccionTope); // Mueve exacto el tiempo del slider
+        digitalWrite(PIN_IN1, LOW);
+        digitalWrite(PIN_IN2, LOW);
+        ledcWrite(CH_DIRECCION, 0);
+        return;
+    }
+    
+    if (cmd == "TEST_DIR:DER") {
+        Serial.println("Test Tope Derecho...");
+        digitalWrite(PIN_IN1, LOW);
+        digitalWrite(PIN_IN2, HIGH);
+        ledcWrite(CH_DIRECCION, P.velocidadDireccion);
+        delay(P.tiempoDireccionTope); // Mueve exacto el tiempo del slider
+        digitalWrite(PIN_IN1, LOW);
+        digitalWrite(PIN_IN2, LOW);
+        ledcWrite(CH_DIRECCION, 0);
+        return;
+    }
+    
+
     // Comandos WASD solo en modo MANUAL
     if (modoActual != MANUAL) return;
 
