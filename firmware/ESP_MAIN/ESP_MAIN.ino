@@ -56,13 +56,14 @@ const int BUFFER_MAX = 64;
 
 struct Parametros {
     // Velocidades (0-255)
-    int velocidadAvance    = 150;
-    int velocidadReversa   = 150;
-    int velocidadParking   = 100;
-    int velocidadDireccion = 200;
+    // Subimos todas a 220 para garantizar que superen el umbral físico de 180
+    int velocidadAvance    = 220; 
+    int velocidadReversa   = 220;
+    int velocidadParking   = 220; 
+    int velocidadDireccion = 208; // Valor calibrado seguro
 
     // Direccion
-    int tiempoDireccionTope = 400; // ms tope a tope
+    int tiempoDireccionTope = 355; // Valor calibrado (ms a la pared virtual)
 
     // Tiempos Fase A - test ciego (ms)
     int tFrenoInicialMs  = 5000;
@@ -209,8 +210,9 @@ void direccionIzquierda() {
     actualizarPosicion();
     ladoDireccion    = DIR_IZQ;
     tInicioDireccion = millis();
-    digitalWrite(PIN_IN1, HIGH);
-    digitalWrite(PIN_IN2, LOW);
+    // Pines invertidos para corregir el giro físico
+    digitalWrite(PIN_IN1, LOW);
+    digitalWrite(PIN_IN2, HIGH);
     ledcWrite(CH_DIRECCION, P.velocidadDireccion);
 }
 
@@ -218,13 +220,28 @@ void direccionDerecha() {
     actualizarPosicion();
     ladoDireccion    = DIR_DER;
     tInicioDireccion = millis();
-    digitalWrite(PIN_IN1, LOW);
-    digitalWrite(PIN_IN2, HIGH);
+    // Pines invertidos para corregir el giro físico
+    digitalWrite(PIN_IN1, HIGH);
+    digitalWrite(PIN_IN2, LOW);
     ledcWrite(CH_DIRECCION, P.velocidadDireccion);
 }
 
 void direccionDetener() {
     actualizarPosicion();
+    
+    // Micro-kick de rescate para desatascar los engranes
+    if (ladoDireccion == DIR_IZQ) {
+        digitalWrite(PIN_IN1, HIGH); // Pulso contrario (Derecha)
+        digitalWrite(PIN_IN2, LOW);
+        ledcWrite(CH_DIRECCION, 255); // Fuerza maxima
+        delay(40); // Tiempo infimo, solo para soltar el engrane
+    } else if (ladoDireccion == DIR_DER) {
+        digitalWrite(PIN_IN1, LOW);  // Pulso contrario (Izquierda)
+        digitalWrite(PIN_IN2, HIGH);
+        ledcWrite(CH_DIRECCION, 255);
+        delay(40);
+    }
+
     ladoDireccion = DIR_STOP;
     digitalWrite(PIN_IN1, LOW);
     digitalWrite(PIN_IN2, LOW);
@@ -393,136 +410,73 @@ void loopTestCiego() {
     unsigned long tEnEstado = millis() - tInicioEstado;
 
     switch (estadoRutina) {
-
         case TC_INICIO:
-            // 5 s detenido simulando encendido (freno ON por regla general)
-            if (tEnEstado >= (unsigned long)P.tFrenoInicialMs) {
-                cambiarEstado(TC_AVANCE_1);
-            }
+            if (tEnEstado >= (unsigned long)P.tFrenoInicialMs) cambiarEstado(TC_AVANCE_1);
             break;
 
         case TC_AVANCE_1:
-            if (!estadoIniciado) {
-                estadoIniciado = true;
-                traccionAvanzar(P.velocidadParking);
-            }
-            if (tEnEstado >= (unsigned long)P.tAvance1Ms) {
-                traccionDetener();
-                cambiarEstado(TC_FRENO_1);
-            }
+            if (!estadoIniciado) { estadoIniciado = true; traccionAvanzar(P.velocidadParking); }
+            if (tEnEstado >= (unsigned long)P.tAvance1Ms) { traccionDetener(); cambiarEstado(TC_FRENO_1); }
             break;
 
         case TC_FRENO_1:
-            if (tEnEstado >= 500) {
-                cambiarEstado(TC_AVANCE_2);
-            }
+            if (tEnEstado >= 2000) cambiarEstado(TC_AVANCE_2);
             break;
 
         case TC_AVANCE_2:
-            if (!estadoIniciado) {
-                estadoIniciado = true;
-                traccionAvanzar(P.velocidadParking);
-            }
-            if (tEnEstado >= (unsigned long)P.tAvance2Ms) {
-                traccionDetener();
-                cambiarEstado(TC_FRENO_2);
-            }
+            if (!estadoIniciado) { estadoIniciado = true; traccionAvanzar(P.velocidadParking); }
+            if (tEnEstado >= (unsigned long)P.tAvance2Ms) { traccionDetener(); cambiarEstado(TC_FRENO_2); }
             break;
 
         case TC_FRENO_2:
-            // Activa intermitentes al encontrar el hueco (simulado)
-            if (!estadoIniciado) {
-                estadoIniciado = true;
-                modoInter = INT_AMBAS;
-            }
-            if (tEnEstado >= 500) {
-                cambiarEstado(TC_GIRO_IZQ);
-            }
+            if (!estadoIniciado) { estadoIniciado = true; modoInter = INT_AMBAS; } // Simula detectar hueco
+            if (tEnEstado >= 2000) cambiarEstado(TC_GIRO_IZQ);
             break;
 
         case TC_GIRO_IZQ:
-            // Direccion izq + avanzar simultaneamente
-            if (!estadoIniciado) {
-                estadoIniciado = true;
-                direccionIzquierda();
-                traccionAvanzar(P.velocidadParking);
-            }
-            if (tEnEstado >= (unsigned long)P.tGiroIzqMs) {
-                traccionDetener();
-                direccionDetener();
-                cambiarEstado(TC_FRENO_3);
-            }
+            // SOLO mueve la direccion
+            if (!estadoIniciado) { estadoIniciado = true; direccionIzquierda(); }
+            if (tEnEstado >= (unsigned long)P.tGiroIzqMs) { direccionDetener(); cambiarEstado(TC_FRENO_3); }
             break;
 
         case TC_FRENO_3:
-            if (tEnEstado >= 500) {
-                cambiarEstado(TC_REVERSA_GIRO);
-            }
+            if (tEnEstado >= 2000) cambiarEstado(TC_REVERSA_GIRO);
             break;
 
         case TC_REVERSA_GIRO:
-            // Direccion der + reversa simultaneamente
-            if (!estadoIniciado) {
-                estadoIniciado = true;
-                direccionDerecha();
-                traccionReversa(P.velocidadParking);
-            }
-            if (tEnEstado >= (unsigned long)P.tReversaGiroMs) {
-                traccionDetener();
-                direccionDetener();
-                cambiarEstado(TC_FRENO_4);
-            }
+            // Avanza con las llantas ya giradas a la izquierda (Ajusta tReversaGiroMs en la GUI si necesitas que sea hacia adelante o atras)
+            if (!estadoIniciado) { estadoIniciado = true; traccionAvanzar(P.velocidadParking); } 
+            if (tEnEstado >= (unsigned long)P.tReversaGiroMs) { traccionDetener(); cambiarEstado(TC_FRENO_4); }
             break;
 
         case TC_FRENO_4:
-            if (tEnEstado >= 500) {
-                cambiarEstado(TC_ENDEREZAR);
-            }
+            if (tEnEstado >= 2000) cambiarEstado(TC_ENDEREZAR);
             break;
 
         case TC_ENDEREZAR:
-            // Calcular cuanto girar para centrar, no bloqueante
-            if (!estadoIniciado) {
-                estadoIniciado = true;
-                int centro     = P.tiempoDireccionTope / 2;
-                int diferencia = centro - posicionDireccion;
-                durEnderezarMs = (unsigned long)abs(diferencia);
-                if      (diferencia > 0) direccionDerecha();
-                else if (diferencia < 0) direccionIzquierda();
-                // Si diferencia == 0, durEnderezarMs = 0, sale en seguida
-            }
-            if (tEnEstado >= durEnderezarMs) {
-                direccionDetener();
-                posicionDireccion = P.tiempoDireccionTope / 2;
-                cambiarEstado(TC_FRENO_5);
-            }
+            // Giro opuesto para la reversa final
+            if (!estadoIniciado) { estadoIniciado = true; direccionDerecha(); }
+            if (tEnEstado >= (unsigned long)P.tiempoDireccionTope) { direccionDetener(); cambiarEstado(TC_FRENO_5); }
             break;
 
         case TC_FRENO_5:
-            if (tEnEstado >= 500) {
-                cambiarEstado(TC_REVERSA_RECTA);
-            }
+            if (tEnEstado >= 2000) cambiarEstado(TC_REVERSA_RECTA);
             break;
 
         case TC_REVERSA_RECTA:
-            if (!estadoIniciado) {
-                estadoIniciado = true;
-                traccionReversa(P.velocidadParking);
-            }
-            if (tEnEstado >= (unsigned long)P.tReversaRectaMs) {
-                traccionDetener();
-                cambiarEstado(TC_FIN);
-            }
+            // Reversa final hacia el hueco
+            if (!estadoIniciado) { estadoIniciado = true; traccionReversa(P.velocidadParking); }
+            if (tEnEstado >= (unsigned long)P.tReversaRectaMs) { traccionDetener(); cambiarEstado(TC_FIN); }
             break;
 
         case TC_FIN:
+            direccionDetener(); // Centra llantas
             modoActual   = ESTACIONADO;
             estadoRutina = NINGUNO;
             modoInter    = INT_AMBAS_FIJAS;
             break;
 
-        default:
-            break;
+        default: break;
     }
 }
 
@@ -609,18 +563,6 @@ void procesarComando(String cmd) {
     //Comandos para el Test de Topes Seguro 
     if (cmd == "TEST_DIR:IZQ") {
         Serial.println("Test Tope Izquierdo...");
-        digitalWrite(PIN_IN1, HIGH);
-        digitalWrite(PIN_IN2, LOW);
-        ledcWrite(CH_DIRECCION, P.velocidadDireccion);
-        delay(P.tiempoDireccionTope); // Mueve exacto el tiempo del slider
-        digitalWrite(PIN_IN1, LOW);
-        digitalWrite(PIN_IN2, LOW);
-        ledcWrite(CH_DIRECCION, 0);
-        return;
-    }
-    
-    if (cmd == "TEST_DIR:DER") {
-        Serial.println("Test Tope Derecho...");
         digitalWrite(PIN_IN1, LOW);
         digitalWrite(PIN_IN2, HIGH);
         ledcWrite(CH_DIRECCION, P.velocidadDireccion);
@@ -631,16 +573,36 @@ void procesarComando(String cmd) {
         return;
     }
     
+    if (cmd == "TEST_DIR:DER") {
+        Serial.println("Test Tope Derecho...");
+        digitalWrite(PIN_IN1, HIGH);
+        digitalWrite(PIN_IN2, LOW);
+        ledcWrite(CH_DIRECCION, P.velocidadDireccion);
+        delay(P.tiempoDireccionTope); // Mueve exacto el tiempo del slider
+        digitalWrite(PIN_IN1, LOW);
+        digitalWrite(PIN_IN2, LOW);
+        ledcWrite(CH_DIRECCION, 0);
+        return;
+    }
+    
 
     // Comandos WASD solo en modo MANUAL
-    if (modoActual != MANUAL) return;
-
-    if      (cmd == "W" || cmd == "w") traccionAvanzar(P.velocidadAvance);
-    else if (cmd == "S" || cmd == "s") traccionReversa(P.velocidadReversa);
-    else if (cmd == "A" || cmd == "a") direccionIzquierda();
-    else if (cmd == "D" || cmd == "d") direccionDerecha();
-    else if (cmd == "X" || cmd == "x") { traccionDetener(); direccionDetener(); }
-    else if (cmd == "C" || cmd == "c") direccionDetener();
+   if (cmd == "W" || cmd == "w" || cmd == "S" || cmd == "s" || 
+        cmd == "A" || cmd == "a" || cmd == "D" || cmd == "d" || 
+        cmd == "X" || cmd == "x" || cmd == "C" || cmd == "c") {
+        
+        if (modoActual != MANUAL) {
+            Serial.println("Intervencion humana: Control manual retomado");
+            pararTodo(); // Reinicia el estado y modo a MANUAL
+        }
+        
+        if      (cmd == "W" || cmd == "w") traccionAvanzar(P.velocidadAvance);
+        else if (cmd == "S" || cmd == "s") traccionReversa(P.velocidadReversa);
+        else if (cmd == "A" || cmd == "a") direccionIzquierda();
+        else if (cmd == "D" || cmd == "d") direccionDerecha();
+        else if (cmd == "X" || cmd == "x") { traccionDetener(); direccionDetener(); }
+        else if (cmd == "C" || cmd == "c") direccionDetener();
+    }
 }
 
 
@@ -675,21 +637,11 @@ void setup() {
     // UART2 a Raspberry Pi
     Serial2.begin(115200, SERIAL_8N1, 16, 17);
 
-    // Calibrar direccion al tope izquierdo para tener origen conocido
-    Serial.println("Calibrando direccion...");
-    calibrarDireccion();
-    Serial.println("Direccion calibrada");
-    Serial.println("Direccion calibrada al tope izquierdo");
-    Serial.println("Centrando direccion para poder avanzar...");
-    digitalWrite(PIN_IN1, LOW);
-    digitalWrite(PIN_IN2, HIGH); // Girar hacia la derecha
-    ledcWrite(CH_DIRECCION, P.velocidadDireccion);
-    delay(P.tiempoDireccionTope / 2); // Esperar la mitad del tiempo total
-    digitalWrite(PIN_IN1, LOW);
-    digitalWrite(PIN_IN2, LOW);
-    ledcWrite(CH_DIRECCION, 0);
-    posicionDireccion = P.tiempoDireccionTope / 2; // Actualizar tracker al centro
-    Serial.println("Direccion centrada");
+    // --- NUEVO: Arranque pasivo (Sin golpes) ---
+    // Asumimos que tú pusiste las llantas derechas con la mano antes de encender el carro.
+    posicionDireccion = P.tiempoDireccionTope / 2; // Actualizar tracker al centro virtual
+    Serial.println("Arranque: Direccion asumida al centro, motores apagados.");
+    // -------------------------------------------
 
     // WiFi AP
     WiFi.softAP(WIFI_SSID, WIFI_PASS);

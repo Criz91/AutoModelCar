@@ -32,10 +32,10 @@ FUENTE_NUMERO  = ("Consolas", 11, "bold")
 
 # Sliders: (clave, label, min, max, default)
 SLIDERS = [
-    ("velocidadParking",    "Vel. parking",       50,  255, 100),
-    ("velocidadAvance",     "Vel. avance",         50,  255, 150),
-    ("velocidadDireccion",  "Vel. direccion",      50,  255, 200),
-    ("tiempoDireccionTope", "Tope direccion (ms)", 200, 800, 400),
+    ("velocidadParking",    "Vel. parking",       50,  255, 220),
+    ("velocidadAvance",     "Vel. avance",         50,  255, 220),
+    ("velocidadDireccion",  "Vel. direccion",      50,  255, 208),
+    ("tiempoDireccionTope", "Tope direccion (ms)", 100, 800, 355),
     ("tAvance1Ms",          "tAvance1 (ms)",       500, 5000, 2000),
     ("tAvance2Ms",          "tAvance2 (ms)",       500, 5000, 2000),
     ("tGiroIzqMs",          "tGiroIzq (ms)",       200, 3000, 1000),
@@ -72,13 +72,17 @@ class App(tk.Tk):
         self.bind_all('<KeyPress>', self._on_tecla_press)
         self.bind_all('<KeyRelease>', self._on_tecla_release)
 
+    def _enviar_continuo(self, tecla):
+        # Latido: reenvia el comando cada 500ms mientras se sostenga la tecla
+        if self.teclas_presionadas.get(tecla, False):
+            if tecla in ["W", "A", "S", "D"]:
+                self.enviar(tecla)
+            self.after(500, lambda: self._enviar_continuo(tecla))
+
     def _on_tecla_press(self, event):
-        # Ignorar teclado si el usuario está escribiendo en la IP o Puerto
         if isinstance(self.focus_get(), tk.Entry): return
-        
         tecla = event.char.upper()
         
-        # Cancelar el timer de release si existe (filtro anti-tartamudeo)
         if tecla in self.teclas_timers:
             self.after_cancel(self.teclas_timers[tecla])
             del self.teclas_timers[tecla]
@@ -87,14 +91,14 @@ class App(tk.Tk):
             self.teclas_presionadas[tecla] = True
             if tecla in ["W", "A", "S", "D"]:
                 self.enviar(tecla)
+                self.after(500, lambda: self._enviar_continuo(tecla)) # Inicia el latido
             elif event.keysym == "space":
-                self.enviar("X") # Barra espaciadora frena todo
+                self.enviar("X")
 
     def _on_tecla_release(self, event):
         if isinstance(self.focus_get(), tk.Entry): return
         tecla = event.char.upper()
         
-        # Retrasar el release 50ms para ignorar el auto-repeat falso del sistema operativo
         timer = self.after(50, lambda: self._ejecutar_release(tecla))
         self.teclas_timers[tecla] = timer
 
