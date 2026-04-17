@@ -34,7 +34,8 @@ FUENTE_NUMERO  = ("Consolas", 11, "bold")
 SLIDERS = [
     ("velocidadAvance",     "Vel. avance",          50,  255,   190),
     ("velocidadReversa",    "Vel. reversa",          50,  255,   210),
-    ("velocidadDireccion",  "Vel. direccion",        50,  255,   208),
+    ("velocidadDireccion",  "Vel. direccion",        50,  255,   245),  # sincronizado con firmware
+    ("boostDireccionIzq",   "Boost izq (PWM)",        0,   50,    10),  # extra PWM llanta dura
     ("tiempoDireccionTope", "Tope dir (ms)",        100,  800,   355),
     ("tAvance1Ms",          "tAvance1 (ms)",        200, 3000,  1000),
     ("tAvance2Ms",          "tAvance2 (ms)",        200, 3000,  1000),
@@ -42,7 +43,7 @@ SLIDERS = [
     ("tReversaGiroMs",      "tReversaGiro (ms)",    200, 3000,  1000),
     ("tEnderezarMs",        "tEnderezar (ms)",      100, 2000,   500),
     ("tReversaRectaMs",     "tReversaRecta (ms)",   200, 3000,  1000),
-    ("tPausaMs",            "Pausa obs (ms)",      1000,30000, 10000),
+    ("tPausaMs",            "Pausa obs (ms)",       200,30000,   500),  # 500ms competencia
     ("distCarroCm",         "Dist. carro (cm)",       5,   40,    15),
     ("distBanquetaCm",      "Dist. banqueta (cm)",    2,   20,     5),
 ]

@@ -49,7 +49,9 @@ const unsigned long TIMEOUT_MANUAL_MS = 1500;
 const unsigned long INTERVALO_TELEMETRIA_MS = 200;
 
 // Intervalo lectura ultrasonicos - rotacion de un sensor por tick (ms)
-const unsigned long INTERVALO_SENSOR_MS = 60;
+// En MANUAL no se leen sensores (evita bloquear el loop con pulseIn)
+const unsigned long INTERVALO_SENSOR_MS      = 60;
+const unsigned long INTERVALO_SENSOR_LENTO_MS = 500; // Lectura lenta en MANUAL (solo para telemetria)
 
 // Longitud maxima del buffer de comandos
 const int BUFFER_MAX = 64;
@@ -59,7 +61,9 @@ struct Parametros {
     int velocidadAvance    = 190; // Velocidad de seguimiento de pista (190 = estable en circuito)
     int velocidadReversa   = 210; // La reversa tiende a ser mas lenta, compensar
     int velocidadParking   = 200; // Para Fase B (maniobra de estacionamiento)
-    int velocidadDireccion = 208;
+    int velocidadDireccion    = 245; // PWM base de direccion
+    int boostDireccionIzq     = 10;  // PWM extra para izquierda (llanta fisicamente mas dura)
+                                     // izq efectivo = velocidadDireccion + boostDireccionIzq (max 255)
 
     // Direccion
     int tiempoDireccionTope = 355; // ms de un tope al otro (calibrado)
@@ -73,7 +77,9 @@ struct Parametros {
     int tReversaGiroMs   = 1000;  // Reversa girando der (mete la cola)
     int tEnderezarMs     = 500;   // Reversa con leve giro der (alinea sin centro real)
     int tReversaRectaMs  = 1000;  // Reversa recta (entra al cajon)
-    int tPausaMs         = 10000; // Pausas de observacion (debug; reducir en competencia)
+    int tPausaMs         = 500;   // Pausas de observacion (500ms competencia; subir a 10000 para debug pausado)
+    int tBoostADMs       = 150;   // Duracion del impulso de traccion al apretar A o D (ms)
+                                 // A 190 PWM (~50 cm/s): 150ms ≈ 7 cm de avance — ajuste minimo
 
     // Fase B - sensores (cm)
     int distCarroCm      = 15;
@@ -192,6 +198,10 @@ bool          corrIzqLado      = false; // true=muy pegado izq, false=muy pegado
 // PARADA_SENIAL
 unsigned long tInicioParada = 0;
 
+// Boost de traccion para A/D (impulso corto, no bloqueante)
+bool          boostADActivo  = false;
+unsigned long tInicioBoostAD = 0;
+
 // TCP
 WiFiServer servidor(TCP_PUERTO);
 WiFiClient cliente;
@@ -239,17 +249,17 @@ void direccionIzquierda() {
     actualizarPosicion();
     ladoDireccion    = DIR_IZQ;
     tInicioDireccion = millis();
-    // Pines invertidos para corregir el giro físico
     digitalWrite(PIN_IN1, LOW);
     digitalWrite(PIN_IN2, HIGH);
-    ledcWrite(CH_DIRECCION, P.velocidadDireccion);
+    // Boost extra para izquierda: llanta fisicamente mas dura que la derecha
+    int pwm = constrain(P.velocidadDireccion + P.boostDireccionIzq, 0, 255);
+    ledcWrite(CH_DIRECCION, pwm);
 }
 
 void direccionDerecha() {
     actualizarPosicion();
     ladoDireccion    = DIR_DER;
     tInicioDireccion = millis();
-    // Pines invertidos para corregir el giro físico
     digitalWrite(PIN_IN1, HIGH);
     digitalWrite(PIN_IN2, LOW);
     ledcWrite(CH_DIRECCION, P.velocidadDireccion);
@@ -773,6 +783,7 @@ void procesarComando(String cmd) {
 
     // STOP: señal de transito — para 6s con intermitentes, luego vuelve a MANUAL
     if (cmd == "STOP" || cmd == "stop") {
+        boostADActivo = false;
         traccionDetener();
         direccionDetener();
         estadoRutina   = NINGUNO;
@@ -806,6 +817,8 @@ void procesarComando(String cmd) {
         else if (clave == "velocidadReversa")    P.velocidadReversa    = valor;
         else if (clave == "velocidadParking")    P.velocidadParking    = valor;
         else if (clave == "velocidadDireccion")  P.velocidadDireccion  = valor;
+        else if (clave == "boostDireccionIzq")   P.boostDireccionIzq   = valor;
+        else if (clave == "tBoostADMs")          P.tBoostADMs          = valor;
         else if (clave == "tiempoDireccionTope") P.tiempoDireccionTope = valor;
         else if (clave == "tFrenoInicialMs")     P.tFrenoInicialMs     = valor;
         else if (clave == "tAvance1Ms")          P.tAvance1Ms          = valor;
@@ -821,7 +834,7 @@ void procesarComando(String cmd) {
         else if (clave == "distLateralMinCm")    P.distLateralMinCm    = valor;
         else if (clave == "largoCarroCm")        P.largoCarroCm        = valor;
         else if (clave == "margenHuecoCm")       P.margenHuecoCm       = valor;
-        else if (clave == "cmPorSegundo")        P.cmPorSegundo        = valor;
+        else if (clave == "cmPorSegundo")        P.cmPorSegundo        = (valor > 0) ? valor : 1; // Evitar division por cero
         else if (clave == "muestrasEstables")    P.muestrasEstables    = valor;
         Serial.print("SET "); Serial.print(clave);
         Serial.print("="); Serial.println(valor);
@@ -897,20 +910,33 @@ void procesarComando(String cmd) {
             pararTodo();
         }
 
-        if      (cmd == "W"  || cmd == "w")  traccionAvanzar(P.velocidadAvance);
-        else if (cmd == "S"  || cmd == "s")  traccionReversa(P.velocidadReversa);
-        else if (cmd == "A"  || cmd == "a") {
+        if (cmd == "W" || cmd == "w") {
+            boostADActivo = false;          // W toma el control; cancela boost de A/D
+            traccionAvanzar(P.velocidadAvance);
+        }
+        else if (cmd == "S" || cmd == "s") {
+            boostADActivo = false;          // S toma el control; cancela boost de A/D
+            traccionReversa(P.velocidadReversa);
+        }
+        else if (cmd == "A" || cmd == "a") {
             direccionIzquierda();
-            // Si la traccion estaba parada, arrancar para que el carro gire mientras avanza
-            if (pwmTraccionActual == 0) traccionAvanzar(P.velocidadAvance);
+            // Si la traccion esta detenida, dar un impulso breve para que el carro se acomode
+            if (pwmTraccionActual == 0 && P.tBoostADMs > 0) {
+                traccionAvanzar(P.velocidadAvance);
+                boostADActivo  = true;
+                tInicioBoostAD = millis();
+            }
         }
-        else if (cmd == "D"  || cmd == "d") {
+        else if (cmd == "D" || cmd == "d") {
             direccionDerecha();
-            // Si la traccion estaba parada, arrancar para que el carro gire mientras avanza
-            if (pwmTraccionActual == 0) traccionAvanzar(P.velocidadAvance);
+            if (pwmTraccionActual == 0 && P.tBoostADMs > 0) {
+                traccionAvanzar(P.velocidadAvance);
+                boostADActivo  = true;
+                tInicioBoostAD = millis();
+            }
         }
-        else if (cmd == "X"  || cmd == "x")  { traccionDetener(); direccionDetener(); }
-        else if (cmd == "TX" || cmd == "tx") traccionDetener();
+        else if (cmd == "X"  || cmd == "x")  { boostADActivo = false; traccionDetener(); direccionDetener(); }
+        else if (cmd == "TX" || cmd == "tx") { boostADActivo = false; traccionDetener(); }
         else if (cmd == "C"  || cmd == "c")  direccionDetener();
     }
 }
@@ -1000,6 +1026,7 @@ void loop() {
     // Timeout modo MANUAL: detener traccion si no llegan comandos
     if (modoActual == MANUAL && pwmTraccionActual > 0) {
         if (ahora - tUltimoComando > TIMEOUT_MANUAL_MS) {
+            boostADActivo = false;
             traccionDetener();
         }
     }
@@ -1009,10 +1036,24 @@ void loop() {
     if (modoActual == ESTACIONAR_DER) loopEstacionarDer();
     if (modoActual == PARADA_SENIAL)  loopParadaSenial();
 
-    // Leer un sensor por tick (rotacion)
-    if (ahora - tUltimoSensor >= INTERVALO_SENSOR_MS) {
-        tUltimoSensor = ahora;
-        leerSensorTurno();
+    // Auto-detener el boost de traccion de A/D tras tBoostADMs
+    if (boostADActivo && ahora - tInicioBoostAD >= (unsigned long)P.tBoostADMs) {
+        traccionDetener();
+        boostADActivo = false;
+    }
+
+    // Leer sensores:
+    //   ESTACIONAR_DER / TEST_CIEGO → lectura rapida (60ms/sensor) — necesaria para la maniobra
+    //   MANUAL / otros              → lectura lenta (500ms/sensor) — solo para telemetria,
+    //                                 evita bloquear el loop con pulseIn durante el circuito
+    {
+        unsigned long intervalo = (modoActual == ESTACIONAR_DER || modoActual == TEST_CIEGO)
+                                  ? INTERVALO_SENSOR_MS
+                                  : INTERVALO_SENSOR_LENTO_MS;
+        if (ahora - tUltimoSensor >= intervalo) {
+            tUltimoSensor = ahora;
+            leerSensorTurno();
+        }
     }
 
     // Actualizar LEDs (no bloqueante)
