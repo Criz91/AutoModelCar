@@ -359,16 +359,19 @@ class App(tk.Tk):
             fila.pack(fill=tk.X, pady=1)
             tk.Label(fila, text=label, bg=COLOR_PANEL, fg=COLOR_TEXTO,
                      font=FUENTE_NORMAL, width=20, anchor=tk.W).pack(side=tk.LEFT)
-            var = tk.IntVar(value=defv)
+            # DoubleVar para el slider; StringVar separado para mostrar entero limpio
+            var      = tk.DoubleVar(value=defv)
+            disp_var = tk.StringVar(value=str(defv))
             self.vars_slider[clave] = var
-            lbl_val = tk.Label(fila, textvariable=var, bg=COLOR_PANEL,
+            lbl_val = tk.Label(fila, textvariable=disp_var, bg=COLOR_PANEL,
                                fg=COLOR_AMARILLO, font=FUENTE_MONO, width=5)
             lbl_val.pack(side=tk.RIGHT)
             slider = ttk.Scale(fila, from_=minv, to=maxv, orient=tk.HORIZONTAL,
-                               variable=var, style="Custom.Horizontal.TScale")
+                               variable=var,
+                               command=lambda v, dv=disp_var: dv.set(str(int(float(v)))))
             slider.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
             slider.bind("<ButtonRelease-1>",
-                        lambda e, k=clave, v=var: self.enviar(f"SET:{k}={v.get()}"))
+                        lambda e, k=clave, v=var: self.enviar(f"SET:{k}={int(v.get())}"))
 
     def _grupo_log(self, padre):
         grp = self._labelframe(padre, "Log de comunicacion")

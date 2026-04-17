@@ -178,13 +178,6 @@ String bufferUART = "";
 // ─── TRACCION ────────────────────────────────────────────────────────────────
 
 void aplicarTraccion(int pwm, bool adelante) {
-    // Kickstart al salir de parado
-    if (pwm > 0 && pwmTraccionActual == 0) {
-        digitalWrite(PIN_IN3, adelante ? HIGH : LOW);
-        digitalWrite(PIN_IN4, adelante ? LOW  : HIGH);
-        ledcWrite(CH_TRACCION, P.kickPwm);
-        delay(P.kickMs);
-    }
     pwmTraccionActual = pwm;
     traccionAdelante  = adelante;
     if (pwm == 0) {
