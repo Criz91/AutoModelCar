@@ -594,10 +594,11 @@ void procesarComando(String cmd) {
     }
     
 
-    // Comandos WASD solo en modo MANUAL
-   if (cmd == "W" || cmd == "w" || cmd == "S" || cmd == "s" || 
-        cmd == "A" || cmd == "a" || cmd == "D" || cmd == "d" || 
-        cmd == "X" || cmd == "x" || cmd == "C" || cmd == "c") {
+    // Comandos WASD (+ TX) solo en modo MANUAL o fuerzan retorno a MANUAL
+    if (cmd == "W" || cmd == "w" || cmd == "S" || cmd == "s" ||
+        cmd == "A" || cmd == "a" || cmd == "D" || cmd == "d" ||
+        cmd == "X" || cmd == "x" || cmd == "TX"|| cmd == "tx" ||
+        cmd == "C" || cmd == "c") {
         
         if (modoActual != MANUAL) {
             Serial.println("Intervencion humana: Control manual retomado");
