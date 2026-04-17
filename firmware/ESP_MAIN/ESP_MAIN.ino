@@ -248,20 +248,6 @@ void direccionDetener() {
     ledcWrite(CH_DIRECCION, 0);
 }
 
-// Calibra el tope izquierdo al arrancar para tener origen conocido
-void calibrarDireccion() {
-    digitalWrite(PIN_IN1, HIGH);
-    digitalWrite(PIN_IN2, LOW);
-    ledcWrite(CH_DIRECCION, P.velocidadDireccion);
-    delay((int)(P.tiempoDireccionTope * 1.3));
-    digitalWrite(PIN_IN1, LOW);
-    digitalWrite(PIN_IN2, LOW);
-    ledcWrite(CH_DIRECCION, 0);
-    posicionDireccion = 0;
-    ladoDireccion     = DIR_STOP;
-    tInicioDireccion  = millis();
-}
-
 
 // ─── ULTRASONICOS ────────────────────────────────────────────────────────────
 
@@ -320,8 +306,9 @@ void actualizarLEDs() {
                 estadoBlink  = !estadoBlink;
             }
             bool b = estadoBlink;
-            digitalWrite(PIN_LED_IZQ, (modoInter == INT_IZQ || modoInter == INT_AMBAS) ? (b ? HIGH : LOW) : LOW);
-            digitalWrite(PIN_LED_DER, (modoInter == INT_DER || modoInter == INT_AMBAS) ? (b ? HIGH : LOW) : LOW);
+            // Pines fisicamente invertidos respecto a su nombre: PIN_LED_IZQ=10 es el fisico DER
+            digitalWrite(PIN_LED_IZQ, (modoInter == INT_DER || modoInter == INT_AMBAS) ? (b ? HIGH : LOW) : LOW);
+            digitalWrite(PIN_LED_DER, (modoInter == INT_IZQ || modoInter == INT_AMBAS) ? (b ? HIGH : LOW) : LOW);
             break;
     }
 }
@@ -434,9 +421,16 @@ void loopTestCiego() {
             break;
 
         case TC_GIRO_IZQ:
-            // SOLO mueve la direccion
-            if (!estadoIniciado) { estadoIniciado = true; direccionIzquierda(); }
-            if (tEnEstado >= (unsigned long)P.tGiroIzqMs) { direccionDetener(); cambiarEstado(TC_FRENO_3); }
+            if (!estadoIniciado) {
+                estadoIniciado = true;
+                direccionIzquierda();
+                traccionAvanzar(P.velocidadParking);
+            }
+            if (tEnEstado >= (unsigned long)P.tGiroIzqMs) {
+                traccionDetener();
+                direccionDetener();
+                cambiarEstado(TC_FRENO_3);
+            }
             break;
 
         case TC_FRENO_3:
@@ -444,9 +438,16 @@ void loopTestCiego() {
             break;
 
         case TC_REVERSA_GIRO:
-            // Avanza con las llantas ya giradas a la izquierda (Ajusta tReversaGiroMs en la GUI si necesitas que sea hacia adelante o atras)
-            if (!estadoIniciado) { estadoIniciado = true; traccionAvanzar(P.velocidadParking); } 
-            if (tEnEstado >= (unsigned long)P.tReversaGiroMs) { traccionDetener(); cambiarEstado(TC_FRENO_4); }
+            if (!estadoIniciado) {
+                estadoIniciado = true;
+                direccionDerecha();
+                traccionReversa(P.velocidadParking);
+            }
+            if (tEnEstado >= (unsigned long)P.tReversaGiroMs) {
+                traccionDetener();
+                direccionDetener();
+                cambiarEstado(TC_FRENO_4);
+            }
             break;
 
         case TC_FRENO_4:
@@ -454,9 +455,16 @@ void loopTestCiego() {
             break;
 
         case TC_ENDEREZAR:
-            // Giro opuesto para la reversa final
-            if (!estadoIniciado) { estadoIniciado = true; direccionDerecha(); }
-            if (tEnEstado >= (unsigned long)P.tiempoDireccionTope) { direccionDetener(); cambiarEstado(TC_FRENO_5); }
+            // Centra ruedas (resorte fisico ayuda) y sigue en reversa mientras se alinea
+            if (!estadoIniciado) {
+                estadoIniciado = true;
+                direccionDetener();
+                traccionReversa(P.velocidadParking);
+                durEnderezarMs = 600;
+            }
+            if (tEnEstado >= durEnderezarMs) {
+                cambiarEstado(TC_FRENO_5);
+            }
             break;
 
         case TC_FRENO_5:
@@ -596,12 +604,13 @@ void procesarComando(String cmd) {
             pararTodo(); // Reinicia el estado y modo a MANUAL
         }
         
-        if      (cmd == "W" || cmd == "w") traccionAvanzar(P.velocidadAvance);
-        else if (cmd == "S" || cmd == "s") traccionReversa(P.velocidadReversa);
-        else if (cmd == "A" || cmd == "a") direccionIzquierda();
-        else if (cmd == "D" || cmd == "d") direccionDerecha();
-        else if (cmd == "X" || cmd == "x") { traccionDetener(); direccionDetener(); }
-        else if (cmd == "C" || cmd == "c") direccionDetener();
+        if      (cmd == "W" || cmd == "w")  traccionAvanzar(P.velocidadAvance);
+        else if (cmd == "S" || cmd == "s")  traccionReversa(P.velocidadReversa);
+        else if (cmd == "A" || cmd == "a")  direccionIzquierda();
+        else if (cmd == "D" || cmd == "d")  direccionDerecha();
+        else if (cmd == "X" || cmd == "x")  { traccionDetener(); direccionDetener(); }
+        else if (cmd == "TX" || cmd == "tx") traccionDetener();
+        else if (cmd == "C" || cmd == "c")  direccionDetener();
     }
 }
 

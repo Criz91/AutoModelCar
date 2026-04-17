@@ -106,12 +106,11 @@ class App(tk.Tk):
         self.teclas_presionadas[tecla] = False
         if tecla in self.teclas_timers:
             del self.teclas_timers[tecla]
-            
-        # Al soltar, mandar el comando de detener correspondiente
+
         if tecla in ["W", "S"]:
-            self.enviar("X") # Frena traccion
+            self.enviar("TX")  # Para solo traccion; no toca la direccion
         elif tecla in ["A", "D"]:
-            self.enviar("C") # Frena direccion
+            self.enviar("C")   # Para solo direccion
 
     # ── Construccion de la UI ─────────────────────────────────────────────────
 
