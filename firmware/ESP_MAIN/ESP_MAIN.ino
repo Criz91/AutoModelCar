@@ -55,33 +55,35 @@ const unsigned long INTERVALO_SENSOR_MS = 60;
 const int BUFFER_MAX = 64;
 
 struct Parametros {
-    // Velocidades (0-255)
-    // Subimos todas a 220 para garantizar que superen el umbral físico de 180
-    int velocidadAvance    = 220; 
-    int velocidadReversa   = 220;
-    int velocidadParking   = 220; 
-    int velocidadDireccion = 208; // Valor calibrado seguro
+    // Velocidades (0-255) — minimo funcional en piso: ~190
+    int velocidadAvance    = 220;
+    int velocidadReversa   = 230; // La reversa tiende a ser mas lenta, compensar
+    int velocidadParking   = 220; // Para Fase B
+    int velocidadDireccion = 208;
 
     // Direccion
-    int tiempoDireccionTope = 355; // Valor calibrado (ms a la pared virtual)
+    int tiempoDireccionTope = 355; // ms de un tope al otro (calibrado)
 
     // Tiempos Fase A - test ciego (ms)
-    int tFrenoInicialMs  = 5000;
-    int tAvance1Ms       = 2000;
-    int tAvance2Ms       = 2000;
-    int tGiroIzqMs       = 1000;
-    int tReversaGiroMs   = 2000;
-    int tReversaRectaMs  = 4000;
+    // El carro mide 31 cm largo x 20 cm ancho
+    int tFrenoInicialMs  = 5000;  // Pausa inicial de arranque
+    int tAvance1Ms       = 1000;  // Avance 1: simula encontrar el primer carro
+    int tAvance2Ms       = 1000;  // Avance 2: sensor queda en mitad del hueco
+    int tGiroIzqMs       = 500;   // Abre a la izq + avanza (posiciona para reversa)
+    int tReversaGiroMs   = 1000;  // Reversa girando der (mete la cola)
+    int tEnderezarMs     = 500;   // Reversa con leve giro der (alinea sin centro real)
+    int tReversaRectaMs  = 1000;  // Reversa recta (entra al cajon)
+    int tPausaMs         = 10000; // Pausas de observacion (debug; reducir en competencia)
 
     // Fase B - sensores (cm)
-    int distCarroCm      = 15;  // umbral "hay carro" (histeresis bajo)
-    int distHuecoCm      = 25;  // umbral "hay hueco" (histeresis alto)
-    int distBanquetaCm   = 5;   // parar antes de banqueta
-    int distLateralMinCm = 3;   // lateral muy cerca -> maniobra correctiva
-    int largoCarroCm     = 25;  // largo estimado del vehiculo
-    int margenHuecoCm    = 5;   // margen extra para confirmar que cabe
-    int cmPorSegundo     = 30;  // calibrar en Fase A (cm/s a velocidadParking)
-    int muestrasEstables = 3;   // muestras consecutivas para confirmar lectura
+    int distCarroCm      = 15;
+    int distHuecoCm      = 25;
+    int distBanquetaCm   = 5;
+    int distLateralMinCm = 3;
+    int largoCarroCm     = 31;  // largo real del vehiculo
+    int margenHuecoCm    = 5;
+    int cmPorSegundo     = 30;  // calibrar en Fase A
+    int muestrasEstables = 3;
 };
 
 enum Modo {
@@ -89,26 +91,43 @@ enum Modo {
     TEST_CIEGO,
     ESTACIONAR_DER,
     ESTACIONADO,
-    ABORTADO
+    ABORTADO,
+    PARADA_SENIAL  // Señal de STOP: 6s parado con intermitentes, luego vuelve a MANUAL
 };
 
 enum EstadoRutina {
     NINGUNO,
-    // Test ciego (Fase A)
+
+    // Fase A - Test ciego (secuencia con pausas de observacion)
     TC_INICIO,
     TC_AVANCE_1,
-    TC_FRENO_1,
+    TC_PAUSA_1,
     TC_AVANCE_2,
-    TC_FRENO_2,
+    TC_PAUSA_2,
     TC_GIRO_IZQ,
-    TC_FRENO_3,
+    TC_PAUSA_3,
     TC_REVERSA_GIRO,
-    TC_FRENO_4,
+    TC_PAUSA_4,
     TC_ENDEREZAR,
-    TC_FRENO_5,
+    TC_PAUSA_5,
     TC_REVERSA_RECTA,
-    TC_FIN
-    // Fase B se agregara cuando Fase A este calibrada
+    TC_FIN,
+
+    // Fase B - Estacionamiento con sensores (ESTACIONAR_DER)
+    PB_INICIO,           // Pausa inicial 5s
+    PB_BUSCA_CARRO,      // Avanza buscando un carro a la derecha
+    PB_DETECTADO_CARRO,  // Carro detectado, sigue avanzando buscando el hueco
+    PB_MIDE_HUECO,       // Midiendo largo del hueco (cronometrando)
+    PB_VERIFICA_CABE,    // Verifica si el hueco es suficiente (largoCarroCm + margenHuecoCm)
+    PB_AVANCE_EXTRA,     // Avanza medio carro para alinear eje trasero con inicio del hueco
+    PB_GIRO_IZQ,         // Abre izq + avanza (mismo que TC_GIRO_IZQ)
+    PB_REVERSA_GIRO,     // Gira der + reversa (mismo que TC_REVERSA_GIRO)
+    PB_ENDEREZAR,        // Leve der + reversa (mismo que TC_ENDEREZAR)
+    PB_REVERSA_BANQUETA, // Reversa recta hasta distTra <= distBanquetaCm
+    PB_CHEQUEO_LATERAL,  // Verifica si un lateral esta muy cerca de un carro vecino
+    PB_MANIOBRA_CORR,    // Saca un poco y ajusta si quedo muy pegado
+    PB_ESTACIONADO,      // Terminado correctamente
+    PB_ABORTADO          // Hueco insuficiente o error
 };
 
 enum ModoIntermitentes {
@@ -143,7 +162,6 @@ unsigned long tInicioDireccion  = 0;
 // Maquina de estados
 bool          estadoIniciado    = false;
 unsigned long tInicioEstado     = 0;
-unsigned long durEnderezarMs    = 0; // tiempo calculado para centrar
 
 // Intermitentes
 unsigned long tUltimoBlink = 0;
@@ -162,6 +180,17 @@ int sensorTurno = 0; // 0=DER 1=IZQ 2=TRA 3=FRE
 
 // Medicion de hueco (Fase B)
 float huecoMedidoCm = 0;
+
+// Fase B - helpers de debounce y maniobra
+unsigned long tCondicionInicio = 0;   // Cuando se detecto la condicion por primera vez
+bool          condicionActiva  = false;
+unsigned long tInicioHueco     = 0;   // Marca de tiempo inicio del hueco (PB_MIDE_HUECO)
+unsigned long durAvanceExtraMs = 0;   // Duracion calculada para PB_AVANCE_EXTRA
+int           intentosCorr     = 0;   // Intentos de maniobra correctiva (max 2)
+bool          corrIzqLado      = false; // true=muy pegado izq, false=muy pegado der
+
+// PARADA_SENIAL
+unsigned long tInicioParada = 0;
 
 // TCP
 WiFiServer servidor(TCP_PUERTO);
@@ -323,6 +352,7 @@ const char* nombreModo() {
         case ESTACIONAR_DER: return "ESTACIONAR_DER";
         case ESTACIONADO:    return "ESTACIONADO";
         case ABORTADO:       return "ABORTADO";
+        case PARADA_SENIAL:  return "PARADA_SENIAL";
     }
     return "?";
 }
@@ -332,17 +362,31 @@ const char* nombreEstado() {
         case NINGUNO:          return "NINGUNO";
         case TC_INICIO:        return "TC_INICIO";
         case TC_AVANCE_1:      return "TC_AVANCE_1";
-        case TC_FRENO_1:       return "TC_FRENO_1";
+        case TC_PAUSA_1:       return "TC_PAUSA_1";
         case TC_AVANCE_2:      return "TC_AVANCE_2";
-        case TC_FRENO_2:       return "TC_FRENO_2";
+        case TC_PAUSA_2:       return "TC_PAUSA_2";
         case TC_GIRO_IZQ:      return "TC_GIRO_IZQ";
-        case TC_FRENO_3:       return "TC_FRENO_3";
+        case TC_PAUSA_3:       return "TC_PAUSA_3";
         case TC_REVERSA_GIRO:  return "TC_REVERSA_GIRO";
-        case TC_FRENO_4:       return "TC_FRENO_4";
+        case TC_PAUSA_4:       return "TC_PAUSA_4";
         case TC_ENDEREZAR:     return "TC_ENDEREZAR";
-        case TC_FRENO_5:       return "TC_FRENO_5";
+        case TC_PAUSA_5:       return "TC_PAUSA_5";
         case TC_REVERSA_RECTA: return "TC_REVERSA_RECTA";
         case TC_FIN:           return "TC_FIN";
+        case PB_INICIO:           return "PB_INICIO";
+        case PB_BUSCA_CARRO:      return "PB_BUSCA_CARRO";
+        case PB_DETECTADO_CARRO:  return "PB_DETECTADO_CARRO";
+        case PB_MIDE_HUECO:       return "PB_MIDE_HUECO";
+        case PB_VERIFICA_CABE:    return "PB_VERIFICA_CABE";
+        case PB_AVANCE_EXTRA:     return "PB_AVANCE_EXTRA";
+        case PB_GIRO_IZQ:         return "PB_GIRO_IZQ";
+        case PB_REVERSA_GIRO:     return "PB_REVERSA_GIRO";
+        case PB_ENDEREZAR:        return "PB_ENDEREZAR";
+        case PB_REVERSA_BANQUETA: return "PB_REVERSA_BANQUETA";
+        case PB_CHEQUEO_LATERAL:  return "PB_CHEQUEO_LATERAL";
+        case PB_MANIOBRA_CORR:    return "PB_MANIOBRA_CORR";
+        case PB_ESTACIONADO:      return "PB_ESTACIONADO";
+        case PB_ABORTADO:         return "PB_ABORTADO";
     }
     return "?";
 }
@@ -397,30 +441,223 @@ void loopTestCiego() {
     unsigned long tEnEstado = millis() - tInicioEstado;
 
     switch (estadoRutina) {
+
+        // --- Pausa inicial 5 s (freno on por regla general) ---
         case TC_INICIO:
-            if (tEnEstado >= (unsigned long)P.tFrenoInicialMs) cambiarEstado(TC_AVANCE_1);
+            if (tEnEstado >= (unsigned long)P.tFrenoInicialMs)
+                cambiarEstado(TC_AVANCE_1);
             break;
 
+        // --- Avance 1: simula encontrar el primer carro ---
         case TC_AVANCE_1:
-            if (!estadoIniciado) { estadoIniciado = true; traccionAvanzar(P.velocidadParking); }
-            if (tEnEstado >= (unsigned long)P.tAvance1Ms) { traccionDetener(); cambiarEstado(TC_FRENO_1); }
+            if (!estadoIniciado) { estadoIniciado = true; traccionAvanzar(P.velocidadAvance); }
+            if (tEnEstado >= (unsigned long)P.tAvance1Ms) { traccionDetener(); cambiarEstado(TC_PAUSA_1); }
             break;
 
-        case TC_FRENO_1:
-            if (tEnEstado >= 2000) cambiarEstado(TC_AVANCE_2);
+        case TC_PAUSA_1:
+            if (tEnEstado >= (unsigned long)P.tPausaMs) cambiarEstado(TC_AVANCE_2);
             break;
 
+        // --- Avance 2: sensor queda aprox en mitad del hueco, enciende intermitentes ---
         case TC_AVANCE_2:
-            if (!estadoIniciado) { estadoIniciado = true; traccionAvanzar(P.velocidadParking); }
-            if (tEnEstado >= (unsigned long)P.tAvance2Ms) { traccionDetener(); cambiarEstado(TC_FRENO_2); }
+            if (!estadoIniciado) {
+                estadoIniciado = true;
+                modoInter = INT_AMBAS;
+                traccionAvanzar(P.velocidadAvance);
+            }
+            if (tEnEstado >= (unsigned long)P.tAvance2Ms) { traccionDetener(); cambiarEstado(TC_PAUSA_2); }
             break;
 
-        case TC_FRENO_2:
-            if (!estadoIniciado) { estadoIniciado = true; modoInter = INT_AMBAS; } // Simula detectar hueco
-            if (tEnEstado >= 2000) cambiarEstado(TC_GIRO_IZQ);
+        case TC_PAUSA_2:
+            if (tEnEstado >= (unsigned long)P.tPausaMs) cambiarEstado(TC_GIRO_IZQ);
             break;
 
+        // --- Giro izquierda + avance: abre el carro para quedar en bateria ---
         case TC_GIRO_IZQ:
+            if (!estadoIniciado) {
+                estadoIniciado = true;
+                direccionIzquierda();
+                traccionAvanzar(P.velocidadAvance);
+            }
+            if (tEnEstado >= (unsigned long)P.tGiroIzqMs) {
+                traccionDetener();
+                direccionDetener();
+                cambiarEstado(TC_PAUSA_3);
+            }
+            break;
+
+        case TC_PAUSA_3:
+            if (tEnEstado >= (unsigned long)P.tPausaMs) cambiarEstado(TC_REVERSA_GIRO);
+            break;
+
+        // --- Giro derecha + reversa: mete la cola al cajon ---
+        case TC_REVERSA_GIRO:
+            if (!estadoIniciado) {
+                estadoIniciado = true;
+                direccionDerecha();
+                traccionReversa(P.velocidadReversa);
+            }
+            if (tEnEstado >= (unsigned long)P.tReversaGiroMs) {
+                traccionDetener();
+                direccionDetener();
+                cambiarEstado(TC_PAUSA_4);
+            }
+            break;
+
+        case TC_PAUSA_4:
+            if (tEnEstado >= (unsigned long)P.tPausaMs) cambiarEstado(TC_ENDEREZAR);
+            break;
+
+        // --- Leve giro der + reversa: alinea (el resorte ayuda a centrar) ---
+        case TC_ENDEREZAR:
+            if (!estadoIniciado) {
+                estadoIniciado = true;
+                direccionDerecha();                      // Giro leve a la derecha
+                traccionReversa(P.velocidadReversa);
+            }
+            // Suelta la direccion a los 150 ms; el resorte centra el resto
+            if (tEnEstado >= 150 && ladoDireccion != DIR_STOP) {
+                direccionDetener();
+            }
+            if (tEnEstado >= (unsigned long)P.tEnderezarMs) {
+                traccionDetener();
+                cambiarEstado(TC_PAUSA_5);
+            }
+            break;
+
+        case TC_PAUSA_5:
+            if (tEnEstado >= (unsigned long)P.tPausaMs) cambiarEstado(TC_REVERSA_RECTA);
+            break;
+
+        // --- Reversa recta: entra al cajon hasta la banqueta ---
+        case TC_REVERSA_RECTA:
+            if (!estadoIniciado) { estadoIniciado = true; traccionReversa(P.velocidadReversa); }
+            if (tEnEstado >= (unsigned long)P.tReversaRectaMs) { traccionDetener(); cambiarEstado(TC_FIN); }
+            break;
+
+        // --- Fin: estacionado ---
+        case TC_FIN:
+            modoActual   = ESTACIONADO;
+            estadoRutina = NINGUNO;
+            modoInter    = INT_AMBAS_FIJAS;
+            break;
+
+        default: break;
+    }
+}
+
+
+// ─── PARADA SEÑAL DE STOP ────────────────────────────────────────────────────
+
+void loopParadaSenial() {
+    if (millis() - tInicioParada >= 6000UL) {
+        modoInter  = INT_OFF;
+        modoActual = MANUAL;
+        Serial.println("PARADA_SENIAL: fin, volviendo a MANUAL");
+    }
+}
+
+
+// ─── FASE B: ESTACIONAMIENTO CON SENSORES ────────────────────────────────────
+
+void loopEstacionarDer() {
+    unsigned long tEnEstado = millis() - tInicioEstado;
+
+    switch (estadoRutina) {
+
+        // --- Pausa inicial 5s (freno on por regla general) ---
+        case PB_INICIO:
+            if (tEnEstado >= 5000UL) {
+                condicionActiva = false;
+                cambiarEstado(PB_BUSCA_CARRO);
+            }
+            break;
+
+        // --- Avanza buscando un carro a la derecha ---
+        // Necesita muestrasEstables * 250ms de lectura estable para confirmar
+        case PB_BUSCA_CARRO:
+            if (!estadoIniciado) { estadoIniciado = true; traccionAvanzar(P.velocidadParking); }
+            if (distDer <= (float)P.distCarroCm) {
+                if (!condicionActiva) { condicionActiva = true; tCondicionInicio = millis(); }
+                else if (millis() - tCondicionInicio >= (unsigned long)(P.muestrasEstables * 250)) {
+                    condicionActiva = false;
+                    cambiarEstado(PB_DETECTADO_CARRO);
+                }
+            } else {
+                condicionActiva = false;
+            }
+            if (tEnEstado >= 30000UL) { pararTodo(); modoActual = ABORTADO; }
+            break;
+
+        // --- Carro detectado; enciende intermitentes y sigue buscando el hueco ---
+        case PB_DETECTADO_CARRO:
+            if (!estadoIniciado) { estadoIniciado = true; modoInter = INT_AMBAS; }
+            if (distDer > (float)P.distHuecoCm) {
+                if (!condicionActiva) { condicionActiva = true; tCondicionInicio = millis(); }
+                else if (millis() - tCondicionInicio >= (unsigned long)(P.muestrasEstables * 250)) {
+                    condicionActiva = false;
+                    tInicioHueco = millis();
+                    cambiarEstado(PB_MIDE_HUECO);
+                }
+            } else {
+                condicionActiva = false;
+            }
+            if (tEnEstado >= 15000UL) { pararTodo(); modoActual = ABORTADO; }
+            break;
+
+        // --- Mide el largo del hueco mientras avanza ---
+        // La traccion sigue activa desde PB_DETECTADO_CARRO, no es necesario reactivarla
+        case PB_MIDE_HUECO: {
+            // Timeout dinamico: un poco mas que el hueco minimo necesario
+            unsigned long timeoutHueco = (unsigned long)((P.largoCarroCm + P.margenHuecoCm + 20) * 1000.0f / P.cmPorSegundo);
+            if (distDer <= (float)P.distCarroCm) {
+                if (!condicionActiva) { condicionActiva = true; tCondicionInicio = millis(); }
+                else if (millis() - tCondicionInicio >= (unsigned long)(P.muestrasEstables * 250)) {
+                    huecoMedidoCm = (float)(millis() - tInicioHueco) * P.cmPorSegundo / 1000.0f;
+                    traccionDetener();
+                    condicionActiva = false;
+                    cambiarEstado(PB_VERIFICA_CABE);
+                }
+            } else {
+                condicionActiva = false;
+            }
+            // Si el hueco es mas largo que el maximo esperado, asumir que cabe
+            if (tEnEstado >= timeoutHueco) {
+                huecoMedidoCm = (float)tEnEstado * P.cmPorSegundo / 1000.0f;
+                traccionDetener();
+                cambiarEstado(PB_VERIFICA_CABE);
+            }
+            break;
+        }
+
+        // --- Verifica si el hueco es suficiente para el vehiculo ---
+        case PB_VERIFICA_CABE:
+            if (huecoMedidoCm >= (float)(P.largoCarroCm + P.margenHuecoCm)) {
+                // Calcula cuanto avanzar para que el eje trasero quede al inicio del hueco
+                durAvanceExtraMs = (unsigned long)((P.largoCarroCm / 2.0f) / P.cmPorSegundo * 1000.0f);
+                Serial.print("Hueco OK: "); Serial.print(huecoMedidoCm); Serial.println(" cm");
+                cambiarEstado(PB_AVANCE_EXTRA);
+            } else {
+                modoActual     = ABORTADO;
+                estadoRutina   = PB_ABORTADO;
+                tInicioEstado  = millis();
+                estadoIniciado = false;
+                modoInter      = INT_AMBAS;
+                Serial.print("Hueco insuficiente: "); Serial.print(huecoMedidoCm); Serial.println(" cm");
+            }
+            break;
+
+        // --- Avanza medio carro para alinear el eje trasero con el inicio del hueco ---
+        case PB_AVANCE_EXTRA:
+            if (!estadoIniciado) { estadoIniciado = true; traccionAvanzar(P.velocidadParking); }
+            if (tEnEstado >= durAvanceExtraMs) {
+                traccionDetener();
+                cambiarEstado(PB_GIRO_IZQ);
+            }
+            break;
+
+        // --- Giro izquierda + avance: abre el carro para entrar en bateria ---
+        case PB_GIRO_IZQ:
             if (!estadoIniciado) {
                 estadoIniciado = true;
                 direccionIzquierda();
@@ -429,15 +666,12 @@ void loopTestCiego() {
             if (tEnEstado >= (unsigned long)P.tGiroIzqMs) {
                 traccionDetener();
                 direccionDetener();
-                cambiarEstado(TC_FRENO_3);
+                cambiarEstado(PB_REVERSA_GIRO);
             }
             break;
 
-        case TC_FRENO_3:
-            if (tEnEstado >= 2000) cambiarEstado(TC_REVERSA_GIRO);
-            break;
-
-        case TC_REVERSA_GIRO:
+        // --- Giro derecha + reversa: mete la cola al cajon ---
+        case PB_REVERSA_GIRO:
             if (!estadoIniciado) {
                 estadoIniciado = true;
                 direccionDerecha();
@@ -446,42 +680,74 @@ void loopTestCiego() {
             if (tEnEstado >= (unsigned long)P.tReversaGiroMs) {
                 traccionDetener();
                 direccionDetener();
-                cambiarEstado(TC_FRENO_4);
+                cambiarEstado(PB_ENDEREZAR);
             }
             break;
 
-        case TC_FRENO_4:
-            if (tEnEstado >= 2000) cambiarEstado(TC_ENDEREZAR);
-            break;
-
-        case TC_ENDEREZAR:
-            // Centra ruedas (resorte fisico ayuda) y sigue en reversa mientras se alinea
+        // --- Leve giro der 150ms + reversa; el resorte centra el resto ---
+        case PB_ENDEREZAR:
             if (!estadoIniciado) {
                 estadoIniciado = true;
-                direccionDetener();
+                direccionDerecha();
                 traccionReversa(P.velocidadParking);
-                durEnderezarMs = 600;
             }
-            if (tEnEstado >= durEnderezarMs) {
-                cambiarEstado(TC_FRENO_5);
+            if (tEnEstado >= 150 && ladoDireccion != DIR_STOP) {
+                direccionDetener();
+            }
+            if (tEnEstado >= (unsigned long)P.tEnderezarMs) {
+                traccionDetener();
+                cambiarEstado(PB_REVERSA_BANQUETA);
             }
             break;
 
-        case TC_FRENO_5:
-            if (tEnEstado >= 2000) cambiarEstado(TC_REVERSA_RECTA);
-            break;
-
-        case TC_REVERSA_RECTA:
-            // Reversa final hacia el hueco
+        // --- Reversa recta hasta llegar a la banqueta (sensor trasero) ---
+        case PB_REVERSA_BANQUETA:
             if (!estadoIniciado) { estadoIniciado = true; traccionReversa(P.velocidadParking); }
-            if (tEnEstado >= (unsigned long)P.tReversaRectaMs) { traccionDetener(); cambiarEstado(TC_FIN); }
+            if (distTra <= (float)P.distBanquetaCm) {
+                traccionDetener();
+                cambiarEstado(PB_CHEQUEO_LATERAL);
+            }
+            if (tEnEstado >= 8000UL) {  // Red de seguridad si el sensor no responde
+                traccionDetener();
+                cambiarEstado(PB_CHEQUEO_LATERAL);
+            }
             break;
 
-        case TC_FIN:
-            direccionDetener(); // Centra llantas
-            modoActual   = ESTACIONADO;
-            estadoRutina = NINGUNO;
-            modoInter    = INT_AMBAS_FIJAS;
+        // --- Verifica que no quedamos muy pegados a un carro vecino ---
+        case PB_CHEQUEO_LATERAL:
+            if (distIzq < (float)P.distLateralMinCm && intentosCorr < 2) {
+                corrIzqLado = true;
+                intentosCorr++;
+                cambiarEstado(PB_MANIOBRA_CORR);
+            } else if (distDer < (float)P.distLateralMinCm && intentosCorr < 2) {
+                corrIzqLado = false;
+                intentosCorr++;
+                cambiarEstado(PB_MANIOBRA_CORR);
+            } else {
+                modoActual     = ESTACIONADO;
+                estadoRutina   = PB_ESTACIONADO;
+                tInicioEstado  = millis();
+                estadoIniciado = false;
+                modoInter      = INT_AMBAS_FIJAS;
+                Serial.println("ESTACIONADO correctamente");
+            }
+            break;
+
+        // --- Sale un poco y corrige el angulo segun el lado mas cercano ---
+        case PB_MANIOBRA_CORR:
+            if (!estadoIniciado) { estadoIniciado = true; traccionAvanzar(P.velocidadParking); }
+            if (tEnEstado >= 500UL) {
+                traccionDetener();
+                if (corrIzqLado) direccionDerecha();   // Muy pegado izq → girar der
+                else             direccionIzquierda(); // Muy pegado der → girar izq
+                delay(150);
+                direccionDetener();
+                cambiarEstado(PB_REVERSA_BANQUETA);
+            }
+            break;
+
+        case PB_ESTACIONADO:
+        case PB_ABORTADO:
             break;
 
         default: break;
@@ -497,10 +763,23 @@ void procesarComando(String cmd) {
 
     tUltimoComando = millis();
 
-    // STOP siempre tiene prioridad
-    if (cmd == "STOP" || cmd == "ESTOP" || cmd == "stop") {
+    // ESTOP: parada de emergencia permanente (GUI, operador)
+    if (cmd == "ESTOP" || cmd == "estop") {
         pararTodo();
-        Serial.println("STOP");
+        Serial.println("ESTOP");
+        return;
+    }
+
+    // STOP: señal de transito — para 6s con intermitentes, luego vuelve a MANUAL
+    if (cmd == "STOP" || cmd == "stop") {
+        traccionDetener();
+        direccionDetener();
+        estadoRutina   = NINGUNO;
+        modoActual     = PARADA_SENIAL;
+        modoInter      = INT_AMBAS;
+        tInicioParada  = millis();
+        estadoIniciado = false;
+        Serial.println("PARADA_SENIAL: 6s intermitentes");
         return;
     }
 
@@ -532,7 +811,9 @@ void procesarComando(String cmd) {
         else if (clave == "tAvance2Ms")          P.tAvance2Ms          = valor;
         else if (clave == "tGiroIzqMs")          P.tGiroIzqMs          = valor;
         else if (clave == "tReversaGiroMs")      P.tReversaGiroMs      = valor;
+        else if (clave == "tEnderezarMs")        P.tEnderezarMs        = valor;
         else if (clave == "tReversaRectaMs")     P.tReversaRectaMs     = valor;
+        else if (clave == "tPausaMs")            P.tPausaMs            = valor;
         else if (clave == "distCarroCm")         P.distCarroCm         = valor;
         else if (clave == "distHuecoCm")         P.distHuecoCm         = valor;
         else if (clave == "distBanquetaCm")      P.distBanquetaCm      = valor;
@@ -562,9 +843,15 @@ void procesarComando(String cmd) {
         return;
     }
 
-    // Iniciar ESTACIONAR DERECHA (Fase B - pendiente)
+    // Iniciar ESTACIONAR DERECHA (Fase B)
     if (cmd == "PR") {
-        Serial.println("PR recibido - Fase B pendiente de implementar");
+        pararTodo();
+        modoActual      = ESTACIONAR_DER;
+        huecoMedidoCm   = 0;
+        intentosCorr    = 0;
+        condicionActiva = false;
+        cambiarEstado(PB_INICIO);
+        Serial.println("ESTACIONAR_DER iniciado");
         return;
     }
 
@@ -599,7 +886,10 @@ void procesarComando(String cmd) {
         cmd == "A" || cmd == "a" || cmd == "D" || cmd == "d" ||
         cmd == "X" || cmd == "x" || cmd == "TX"|| cmd == "tx" ||
         cmd == "C" || cmd == "c") {
-        
+
+        // Durante una parada de señal no interrumpir con movimiento
+        if (modoActual == PARADA_SENIAL) return;
+
         if (modoActual != MANUAL) {
             Serial.println("Intervencion humana: Control manual retomado");
             pararTodo(); // Reinicia el estado y modo a MANUAL
@@ -705,9 +995,9 @@ void loop() {
     }
 
     // Avanzar maquina de estados activa
-    if (modoActual == TEST_CIEGO) {
-        loopTestCiego();
-    }
+    if (modoActual == TEST_CIEGO)     loopTestCiego();
+    if (modoActual == ESTACIONAR_DER) loopEstacionarDer();
+    if (modoActual == PARADA_SENIAL)  loopParadaSenial();
 
     // Leer un sensor por tick (rotacion)
     if (ahora - tUltimoSensor >= INTERVALO_SENSOR_MS) {

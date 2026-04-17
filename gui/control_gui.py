@@ -10,8 +10,8 @@ HOST_DEFAULT  = "192.168.4.1"
 PUERTO_DEFAULT = 8080
 
 # Colores
-COLOR_FONDO        = "#1e1e2e"
-COLOR_PANEL        = "#2a2a3e"
+COLOR_FONDO        = "#000000"
+COLOR_PANEL        = "#04041a"
 COLOR_BORDE        = "#3a3a5e"
 COLOR_TEXTO        = "#cdd6f4"
 COLOR_TEXTO_DIM    = "#6c7086"
@@ -32,17 +32,19 @@ FUENTE_NUMERO  = ("Consolas", 11, "bold")
 
 # Sliders: (clave, label, min, max, default)
 SLIDERS = [
-    ("velocidadParking",    "Vel. parking",       50,  255, 220),
-    ("velocidadAvance",     "Vel. avance",         50,  255, 220),
-    ("velocidadDireccion",  "Vel. direccion",      50,  255, 208),
-    ("tiempoDireccionTope", "Tope direccion (ms)", 100, 800, 355),
-    ("tAvance1Ms",          "tAvance1 (ms)",       500, 5000, 2000),
-    ("tAvance2Ms",          "tAvance2 (ms)",       500, 5000, 2000),
-    ("tGiroIzqMs",          "tGiroIzq (ms)",       200, 3000, 1000),
-    ("tReversaGiroMs",      "tReversaGiro (ms)",   500, 5000, 2000),
-    ("tReversaRectaMs",     "tReversaRecta (ms)",  500, 8000, 4000),
-    ("distCarroCm",         "Dist. carro (cm)",      5,   40,   15),
-    ("distBanquetaCm",      "Dist. banqueta (cm)",   2,   20,    5),
+    ("velocidadAvance",     "Vel. avance",          50,  255,   220),
+    ("velocidadReversa",    "Vel. reversa",          50,  255,   230),
+    ("velocidadDireccion",  "Vel. direccion",        50,  255,   208),
+    ("tiempoDireccionTope", "Tope dir (ms)",        100,  800,   355),
+    ("tAvance1Ms",          "tAvance1 (ms)",        200, 3000,  1000),
+    ("tAvance2Ms",          "tAvance2 (ms)",        200, 3000,  1000),
+    ("tGiroIzqMs",          "tGiroIzq (ms)",        100, 2000,   500),
+    ("tReversaGiroMs",      "tReversaGiro (ms)",    200, 3000,  1000),
+    ("tEnderezarMs",        "tEnderezar (ms)",      100, 2000,   500),
+    ("tReversaRectaMs",     "tReversaRecta (ms)",   200, 3000,  1000),
+    ("tPausaMs",            "Pausa obs (ms)",      1000,30000, 10000),
+    ("distCarroCm",         "Dist. carro (cm)",       5,   40,    15),
+    ("distBanquetaCm",      "Dist. banqueta (cm)",    2,   20,     5),
 ]
 
 
@@ -242,11 +244,11 @@ class App(tk.Tk):
                                 cursor="hand2", command=lambda: self.enviar("PR"))
         self.btn_pr.pack(fill=tk.X, pady=(0, 4))
 
-        self.btn_stop = tk.Button(grp, text="STOP", height=3,
+        self.btn_stop = tk.Button(grp, text="STOP DE EMERGENCIA (ESTOP)", height=3,
                                   bg="#4a1e1e", fg=COLOR_ROJO,
                                   activebackground="#6a2e2e", activeforeground=COLOR_ROJO,
-                                  font=("Segoe UI", 13, "bold"), relief=tk.FLAT,
-                                  cursor="hand2", command=lambda: self.enviar("STOP"))
+                                  font=("Segoe UI", 11, "bold"), relief=tk.FLAT,
+                                  cursor="hand2", command=lambda: self.enviar("ESTOP"))
         self.btn_stop.pack(fill=tk.X)
 
     def _grupo_leds(self, padre):
@@ -582,6 +584,7 @@ class App(tk.Tk):
             "ESTACIONAR_DER": COLOR_NARANJA,
             "ESTACIONADO":    COLOR_VERDE,
             "ABORTADO":       COLOR_ROJO,
+            "PARADA_SENIAL":  COLOR_AMARILLO,
         }.get(modo, COLOR_TEXTO)
 
         self.label_modo.configure(text=f"Modo:   {modo}", fg=color_modo)
