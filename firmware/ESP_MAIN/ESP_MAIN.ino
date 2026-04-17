@@ -56,9 +56,9 @@ const int BUFFER_MAX = 64;
 
 struct Parametros {
     // Velocidades (0-255) — minimo funcional en piso: ~190
-    int velocidadAvance    = 220;
-    int velocidadReversa   = 230; // La reversa tiende a ser mas lenta, compensar
-    int velocidadParking   = 220; // Para Fase B
+    int velocidadAvance    = 190; // Velocidad de seguimiento de pista (190 = estable en circuito)
+    int velocidadReversa   = 210; // La reversa tiende a ser mas lenta, compensar
+    int velocidadParking   = 200; // Para Fase B (maniobra de estacionamiento)
     int velocidadDireccion = 208;
 
     // Direccion
@@ -416,7 +416,8 @@ void enviarTelemetria() {
         huecoMedidoCm
     );
     if (cliente && cliente.connected()) cliente.print(buf);
-    Serial.print(buf);
+    Serial2.print(buf);   // Telemetria a Raspberry Pi por UART2
+    Serial.print(buf);    // Debug por USB
 }
 
 
@@ -881,27 +882,36 @@ void procesarComando(String cmd) {
     }
     
 
-    // Comandos WASD (+ TX) solo en modo MANUAL o fuerzan retorno a MANUAL
-    if (cmd == "W" || cmd == "w" || cmd == "S" || cmd == "s" ||
-        cmd == "A" || cmd == "a" || cmd == "D" || cmd == "d" ||
-        cmd == "X" || cmd == "x" || cmd == "TX"|| cmd == "tx" ||
-        cmd == "C" || cmd == "c") {
+    // Comandos de movimiento — modo MANUAL o fuerzan retorno a MANUAL
+    // La Pi manda: W, A, S, D (maiusculas). La GUI puede mandar TX y C ademas.
+    if (cmd == "W"  || cmd == "w"  || cmd == "S"  || cmd == "s"  ||
+        cmd == "A"  || cmd == "a"  || cmd == "D"  || cmd == "d"  ||
+        cmd == "X"  || cmd == "x"  || cmd == "TX" || cmd == "tx" ||
+        cmd == "C"  || cmd == "c") {
 
         // Durante una parada de señal no interrumpir con movimiento
         if (modoActual == PARADA_SENIAL) return;
 
         if (modoActual != MANUAL) {
             Serial.println("Intervencion humana: Control manual retomado");
-            pararTodo(); // Reinicia el estado y modo a MANUAL
+            pararTodo();
         }
-        
-        if      (cmd == "W" || cmd == "w")  traccionAvanzar(P.velocidadAvance);
-        else if (cmd == "S" || cmd == "s")  traccionReversa(P.velocidadReversa);
-        else if (cmd == "A" || cmd == "a")  direccionIzquierda();
-        else if (cmd == "D" || cmd == "d")  direccionDerecha();
-        else if (cmd == "X" || cmd == "x")  { traccionDetener(); direccionDetener(); }
+
+        if      (cmd == "W"  || cmd == "w")  traccionAvanzar(P.velocidadAvance);
+        else if (cmd == "S"  || cmd == "s")  traccionReversa(P.velocidadReversa);
+        else if (cmd == "A"  || cmd == "a") {
+            direccionIzquierda();
+            // Si la traccion estaba parada, arrancar para que el carro gire mientras avanza
+            if (pwmTraccionActual == 0) traccionAvanzar(P.velocidadAvance);
+        }
+        else if (cmd == "D"  || cmd == "d") {
+            direccionDerecha();
+            // Si la traccion estaba parada, arrancar para que el carro gire mientras avanza
+            if (pwmTraccionActual == 0) traccionAvanzar(P.velocidadAvance);
+        }
+        else if (cmd == "X"  || cmd == "x")  { traccionDetener(); direccionDetener(); }
         else if (cmd == "TX" || cmd == "tx") traccionDetener();
-        else if (cmd == "C" || cmd == "c")  direccionDetener();
+        else if (cmd == "C"  || cmd == "c")  direccionDetener();
     }
 }
 

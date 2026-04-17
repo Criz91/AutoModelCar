@@ -105,8 +105,14 @@ def decision_ia(tel: dict) -> str | None:
     """
     Retorna el comando de movimiento para el siguiente tick.
 
-    Valores validos: "W", "S", "A", "D", "TX", "C", "X"
-    Retornar None para no enviar nada en este tick (mantiene el ultimo comando).
+    Valores validos: "W", "A", "S", "D", "X" o None (no enviar nada en este tick).
+
+    Protocolo de comandos al ESP32:
+        "W" = traccion adelante (la direccion queda como estaba)
+        "S" = traccion reversa  (la direccion queda como estaba)
+        "A" = girar izquierda; si el carro estaba parado, tambien arranca traccion
+        "D" = girar derecha;   si el carro estaba parado, tambien arranca traccion
+        "X" = para todo (traccion + direccion)
 
     Parametro tel: diccionario con la telemetria actual del ESP.
     Campos utiles:

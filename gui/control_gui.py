@@ -32,8 +32,8 @@ FUENTE_NUMERO  = ("Consolas", 11, "bold")
 
 # Sliders: (clave, label, min, max, default)
 SLIDERS = [
-    ("velocidadAvance",     "Vel. avance",          50,  255,   220),
-    ("velocidadReversa",    "Vel. reversa",          50,  255,   230),
+    ("velocidadAvance",     "Vel. avance",          50,  255,   190),
+    ("velocidadReversa",    "Vel. reversa",          50,  255,   210),
     ("velocidadDireccion",  "Vel. direccion",        50,  255,   208),
     ("tiempoDireccionTope", "Tope dir (ms)",        100,  800,   355),
     ("tAvance1Ms",          "tAvance1 (ms)",        200, 3000,  1000),
