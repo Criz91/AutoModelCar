@@ -1,7 +1,7 @@
 // AutoModelCar TMR 2026 - Prueba de estacionamiento autonomo en bateria
 // Plataforma: ESP32-S3
 // Direccion: motor DC de carrito (sin encoder), control por tiempo
-// Traccion: motores DC amarillos via L298N con kickstart
+// Traccion: motores DC amarillos via L298N
 
 #include <WiFi.h>
 #include <WiFiServer.h>
