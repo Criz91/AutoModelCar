@@ -61,6 +61,23 @@ class App(tk.Tk):
 
         self._construir_ui()
         self._drenar_cola()
+        # Trackers para no inundar el log
+        self.ultimo_modo = None
+        self.ultimo_estado = None
+
+        # Bindings de teclado (Bug 4)
+        self.bind_all('<KeyPress>', self._on_tecla)
+
+    def _on_tecla(self, event):
+        # Ignorar teclado si el usuario está escribiendo en la IP o Puerto
+        if isinstance(self.focus_get(), tk.Entry):
+            return
+            
+        tecla = event.char.upper()
+        if tecla in ["W", "A", "S", "D", "X", "C"]:
+            self.enviar(tecla)
+        elif event.keysym == "space":
+            self.enviar("X") # Barra espaciadora frena todo
 
     # ── Construccion de la UI ─────────────────────────────────────────────────
 
@@ -498,7 +515,6 @@ class App(tk.Tk):
         self.after(50, self._drenar_cola)
 
     def _procesar_json(self, linea):
-        self._log(f"< {linea}", "recibido")
         try:
             datos = json.loads(linea)
         except json.JSONDecodeError:
@@ -509,6 +525,12 @@ class App(tk.Tk):
         estado = datos.get("estado", "?")
         t_est  = datos.get("tEstado", 0)
         hueco  = datos.get("hueco", 0.0)
+
+        # Fix Bug 6: Solo loguear cuando hay un cambio real de estado o modo
+        if modo != self.ultimo_modo or estado != self.ultimo_estado:
+            self._log(f"Cambio -> Modo: {modo} | Estado: {estado}", "evento")
+            self.ultimo_modo = modo
+            self.ultimo_estado = estado
 
         color_modo = {
             "MANUAL":         COLOR_AZUL,
@@ -523,18 +545,22 @@ class App(tk.Tk):
         self.label_tiempo.configure(text=f"En estado: {t_est} ms")
         self.label_hueco.configure(text=f"Hueco medido: {hueco:.1f} cm")
 
-        # Sensores
+        # Sensores (Fix Bug 5: Barra llena con 999)
         MAX_CM = 100.0
         for clave, val_key in [("dR", "dR"), ("dL", "dL"), ("dB", "dB"), ("dF", "dF")]:
             val = datos.get(val_key, 999)
             canvas, barra = self.barras_sensor[clave]
             canvas.update_idletasks()
             w = canvas.winfo_width()
-            proporcion = min(val / MAX_CM, 1.0)
+            
+            if val >= 999:
+                proporcion = 0.0
+                color = COLOR_TEXTO_DIM # Gris para indicar que no hay lectura
+            else:
+                proporcion = min(val / MAX_CM, 1.0)
+                color = (COLOR_VERDE if val > 20 else COLOR_AMARILLO if val > 10 else COLOR_ROJO)
+                
             ancho_barra = int(w * proporcion)
-            color = (COLOR_VERDE if val > 20
-                     else COLOR_AMARILLO if val > 10
-                     else COLOR_ROJO)
             canvas.itemconfigure(barra, fill=color)
             canvas.coords(barra, 0, 0, ancho_barra, 16)
             txt = f"{val:.0f} cm" if val < 999 else "--- cm"

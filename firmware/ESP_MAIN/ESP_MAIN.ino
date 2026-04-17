@@ -64,10 +64,6 @@ struct Parametros {
     // Direccion
     int tiempoDireccionTope = 400; // ms tope a tope
 
-    // Kickstart (superar friccion estatica)
-    int kickPwm = 240;
-    int kickMs  = 150;
-
     // Tiempos Fase A - test ciego (ms)
     int tFrenoInicialMs  = 5000;
     int tAvance1Ms       = 2000;
@@ -569,8 +565,6 @@ void procesarComando(String cmd) {
         else if (clave == "velocidadParking")    P.velocidadParking    = valor;
         else if (clave == "velocidadDireccion")  P.velocidadDireccion  = valor;
         else if (clave == "tiempoDireccionTope") P.tiempoDireccionTope = valor;
-        else if (clave == "kickPwm")             P.kickPwm             = valor;
-        else if (clave == "kickMs")              P.kickMs              = valor;
         else if (clave == "tFrenoInicialMs")     P.tFrenoInicialMs     = valor;
         else if (clave == "tAvance1Ms")          P.tAvance1Ms          = valor;
         else if (clave == "tAvance2Ms")          P.tAvance2Ms          = valor;
@@ -659,6 +653,17 @@ void setup() {
     Serial.println("Calibrando direccion...");
     calibrarDireccion();
     Serial.println("Direccion calibrada");
+    Serial.println("Direccion calibrada al tope izquierdo");
+    Serial.println("Centrando direccion para poder avanzar...");
+    digitalWrite(PIN_IN1, LOW);
+    digitalWrite(PIN_IN2, HIGH); // Girar hacia la derecha
+    ledcWrite(CH_DIRECCION, P.velocidadDireccion);
+    delay(P.tiempoDireccionTope / 2); // Esperar la mitad del tiempo total
+    digitalWrite(PIN_IN1, LOW);
+    digitalWrite(PIN_IN2, LOW);
+    ledcWrite(CH_DIRECCION, 0);
+    posicionDireccion = P.tiempoDireccionTope / 2; // Actualizar tracker al centro
+    Serial.println("Direccion centrada");
 
     // WiFi AP
     WiFi.softAP(WIFI_SSID, WIFI_PASS);
